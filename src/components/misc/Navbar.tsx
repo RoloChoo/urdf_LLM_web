@@ -97,7 +97,7 @@ export default function Navbar() {
       {/* Mobile: Right-side icons only */}
       <div className="ml-auto flex items-center gap-4 md:hidden">
         <a
-          href="https://github.com/jurmy24/mechaverse"
+          href="https://github.com/whydumb/urdf_LLM"
           target="_blank"
           rel="noopener noreferrer"
           className="hover:-translate-y-1 transition-transform flex items-center gap-2 group"
@@ -113,7 +113,7 @@ export default function Navbar() {
           </svg>
         </a>
         <a
-          href="https://discord.gg/UDYNE7qRVb"
+          href="https://discord.gg/JqpfXxS4j"
           target="_blank"
           rel="noopener noreferrer"
           className="hover:-translate-y-1 transition-transform flex items-center gap-2 group"
