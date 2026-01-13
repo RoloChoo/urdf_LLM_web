@@ -1,0 +1,66 @@
+<?xml version="1.0"?>
+<robot name="ax12a_with_long_arm_jointstates">
+
+  <link name="base_link"/>
+
+  <!-- 모터 바디(고정 메쉬) -->
+  <link name="motor_body">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://YOUR_PACKAGE_NAME/meshes/AX_12A.STL"
+              scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="dark_gray">
+        <color rgba="0.25 0.25 0.25 1.0"/>
+      </material>
+    </visual>
+  </link>
+
+  <joint name="base_to_body" type="fixed">
+    <parent link="base_link"/>
+    <child link="motor_body"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- 출력축 기준 프레임(비주얼 없음) -->
+  <link name="output_frame"/>
+
+  <!-- 🔧 여기 xyz를 조절해서 "모터 위 출력축 위치"로 맞추면 됨 -->
+  <joint name="body_to_output" type="fixed">
+    <parent link="motor_body"/>
+    <child link="output_frame"/>
+    <origin xyz="0 0 0.025" rpy="0 0 0"/>
+  </joint>
+
+  <!-- 길게 보이는 레버(arm) -->
+  <link name="arm_link">
+    <visual>
+      <!-- 길이 L=0.30m면 축에서 +X로 뻗게: origin x = L/2 -->
+      <origin xyz="0.15 0 0.01" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.30 0.02 0.02"/>
+      </geometry>
+      <material name="red">
+        <color rgba="0.9 0.1 0.1 1.0"/>
+      </material>
+    </visual>
+  </link>
+
+  <!-- ✅ 핵심: revolute + limit (joint_state_publisher_gui가 슬라이더 만들 수 있음) -->
+  <joint name="ax12a_joint" type="revolute">
+    <parent link="output_frame"/>
+    <child link="arm_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+
+    <!-- 회전축 -->
+    <axis xyz="0 0 1"/>
+
+    <!-- AX-12A: 300도 ≈ ±150도 = ±2.61799 rad -->
+    <limit lower="-2.6179939" upper="2.6179939" effort="2.0" velocity="6.0"/>
+
+    <!-- (옵션) RViz엔 영향 없고, 시뮬에서만 도움 -->
+    <!-- <dynamics damping="0.1" friction="0.0"/> -->
+  </joint>
+
+</robot>
