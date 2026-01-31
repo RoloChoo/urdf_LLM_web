@@ -1,7 +1,6 @@
-// src/components/chat/ChatWidget.tsx
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { ChevronDown, Loader2, Mic, Plus, Sparkles } from "lucide-react";
 
 type ConversationMessage = {
@@ -10,37 +9,92 @@ type ConversationMessage = {
   content: string;
 };
 
-type PlanResponse = {
+type IntentResponse = {
   text: string;
-  reasoning?: string;
-  motions?: Array<{
+  intent: {
+    goal: string;
+    style?: string;
+    duration_ms?: number;
+    sketch?: Array<{
+      joint_hint: string;
+      delta_rad?: number;
+      target_angle_rad?: number;
+    }>;
+    constraints?: Record<string, unknown>;
+  };
+  error?: string;
+};
+
+type MotorResponse = {
+  motions: Array<{
     joint: string;
     angle: number;
     time: number;
+    speed?: number;
   }>;
   error?: string;
 };
 
-type JointLimits = Record<string, { lower?: number; upper?: number }>;
-
-type UrdfMeta = {
-  availableJoints: string[];
-  jointLimitsRadians: JointLimits;
+type ExecuteResponse = {
+  ok?: boolean;
+  motions?: Array<{
+    joint: string;
+    angle: number;
+    time?: number;
+    speed?: number;
+  }>;
+  warnings?: string[];
+  error?: string;
 };
+
+type RLTrainingSummary = {
+  when: string;
+  policyLabel: string;
+  episodes: number;
+  bestReturn: number;
+  lastReturn: number | null;
+  actionDim: number;
+  obsDim: number;
+  frameSkip: number;
+  maxSteps: number;
+  baseBodyId?: number | null;
+  targetHeight?: number | null;
+  termReasonCounts?: Record<string, number>;
+};
+
+type TaskPlannerResponse = {
+  text: string;
+  plan: {
+    goal: string;
+    rlConfig?: {
+      reward?: Record<string, number>;
+      terminate?: Record<string, number>;
+      frameSkip?: number;
+      maxSteps?: number;
+      actionMode?: "normalized" | "direct";
+    };
+    actionHint?: {
+      kind: "sine";
+      amp?: number;
+      speed?: number;
+      bias?: number[];
+      scale?: number[];
+      phase?: number[];
+    };
+  };
+  error?: string;
+};
+
+type JointLimits = Record<string, { lower?: number; upper?: number }>;
+type UrdfMeta = { availableJoints: string[]; jointLimitsRadians: JointLimits };
 
 const EMPTY_HINT = "LLM 답변은 이 자리에서 바로 확인할 수 있어요.";
-
-// ✅ 여기에 “공식 alias”를 필요하면 추가해두면 됨 (가장 안정적)
-const DEFAULT_JOINT_NAME_MAP: Record<string, string> = {
-  // 예시:
-  // shoulder_joint: "l_shoulder_pitch",
-  // elbow_joint: "l_elbow_pitch",
-};
+const DEFAULT_JOINT_NAME_MAP: Record<string, string> = {};
 
 const normalizeJointKey = (s: string) =>
   s
     .toLowerCase()
-    .replace(/[\s\-_\.]/g, "")
+    .replace(/[\s\-_.]/g, "")
     .replace(/joint/g, "")
     .trim();
 
@@ -54,24 +108,15 @@ function resolveJointName(
 
   const n = normalizeJointKey(llmJoint);
 
-  // 0) 공식 매핑 우선
-  const mapped =
-    map[llmJoint] ??
-    map[llmJoint.toLowerCase()] ??
-    map[n] ??
-    null;
-
+  const mapped = map[llmJoint] ?? map[llmJoint.toLowerCase()] ?? map[n] ?? null;
   if (mapped && available.includes(mapped)) return mapped;
 
-  // 1) exact match (case-insensitive)
   const exact = available.find((a) => a.toLowerCase() === llmJoint.toLowerCase());
   if (exact) return exact;
 
-  // 2) normalized exact
   const nExact = available.find((a) => normalizeJointKey(a) === n);
   if (nExact) return nExact;
 
-  // 3) includes heuristic
   const partial = available.find((a) => {
     const an = normalizeJointKey(a);
     return an.includes(n) || n.includes(an);
@@ -85,8 +130,6 @@ function getUrdfMetaFromWindowOrDom(): UrdfMeta | null {
   if (typeof window === "undefined") return null;
 
   const w = window as any;
-
-  // 1) UrdfViewer가 window에 노출해준 값 우선 사용
   const jointsFromWindow: unknown = w.__URDF_JOINTS__;
   const limitsFromWindow: unknown = w.__URDF_JOINT_LIMITS__;
 
@@ -98,17 +141,15 @@ function getUrdfMetaFromWindowOrDom(): UrdfMeta | null {
       ? (limitsFromWindow as JointLimits)
       : {};
 
-  if (availableJoints.length > 0) {
-    return { availableJoints, jointLimitsRadians };
-  }
+  if (availableJoints.length > 0) return { availableJoints, jointLimitsRadians };
 
-  // 2) fallback: DOM에서 직접 viewer 조회
   try {
     const viewer = document.querySelector("urdf-viewer") as any;
     const joints = viewer?.robot?.joints;
     if (joints && typeof joints === "object") {
       const keys = Object.keys(joints);
       const limits: JointLimits = {};
+
       for (const k of keys) {
         const j = joints[k];
         const lim = j?.limit ?? j?.limits ?? null;
@@ -121,10 +162,9 @@ function getUrdfMetaFromWindowOrDom(): UrdfMeta | null {
           (typeof lim?.upper === "number" ? lim.upper : undefined) ??
           (typeof lim?.max === "number" ? lim.max : undefined);
 
-        if (typeof lower === "number" || typeof upper === "number") {
-          limits[k] = { lower, upper };
-        }
+        if (typeof lower === "number" || typeof upper === "number") limits[k] = { lower, upper };
       }
+
       return { availableJoints: keys, jointLimitsRadians: limits };
     }
   } catch {
@@ -137,8 +177,6 @@ function getUrdfMetaFromWindowOrDom(): UrdfMeta | null {
 function buildPlannerContext(meta: UrdfMeta | null): string | undefined {
   if (!meta?.availableJoints?.length) return undefined;
 
-  // 너무 길어지면 모델이 싫어할 수 있어서 limit는 있는 것만 보내고,
-  // 그래도 길면 joints만 보내도 충분함.
   const payload = {
     availableJoints: meta.availableJoints,
     jointLimitsRadians: meta.jointLimitsRadians,
@@ -155,12 +193,129 @@ function buildPlannerContext(meta: UrdfMeta | null): string | undefined {
   ].join("\n");
 }
 
+type Stage = "intent" | "motor" | "execute" | "task_planner";
+type Phase = "start" | "end";
+
+function estTok(chars: number) {
+  if (!Number.isFinite(chars) || chars <= 0) return 0;
+  return Math.max(1, Math.round(chars / 4));
+}
+
+function emitAiStage(detail: {
+  stage: Stage;
+  phase: Phase;
+  ok?: boolean;
+  ms?: number;
+  inChars?: number;
+  outChars?: number;
+  inTok?: number;
+  outTok?: number;
+}) {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent("ai:stage", { detail }));
+}
+
 export default function ChatWidget() {
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [plannerLoading, setPlannerLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const messagesRef = useRef<ConversationMessage[]>([]);
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  // RL training end -> planner
+  useEffect(() => {
+    const onTrainingSummary = (ev: Event) => {
+      const summary = (ev as CustomEvent<RLTrainingSummary>).detail;
+      void runTaskPlanner(summary);
+    };
+
+    window.addEventListener("rl:trainingSummary", onTrainingSummary as any);
+    return () => window.removeEventListener("rl:trainingSummary", onTrainingSummary as any);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function runTaskPlanner(summary: RLTrainingSummary) {
+    try {
+      setPlannerLoading(true);
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: `학습 종료 요약 수신 (best=${summary.bestReturn.toFixed(2)}, eps=${summary.episodes}). 다음 목표를 계획중…`,
+        },
+      ]);
+
+      const urdfMeta = getUrdfMetaFromWindowOrDom();
+      const context = buildPlannerContext(urdfMeta);
+
+      const historyPayload = messagesRef.current.map(({ role, content }) => ({ role, content }));
+
+      const reqBody = {
+        summary,
+        history: historyPayload,
+        context,
+      };
+
+      const inChars = JSON.stringify(reqBody).length;
+      emitAiStage({ stage: "task_planner", phase: "start", inChars, inTok: estTok(inChars) });
+
+      const t0 = performance.now();
+      const resp = await fetch("/api/task-planner", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(reqBody),
+      });
+
+      const data = (await resp.json()) as TaskPlannerResponse;
+      const ms = Math.round(performance.now() - t0);
+      const outChars = JSON.stringify(data).length;
+
+      emitAiStage({
+        stage: "task_planner",
+        phase: "end",
+        ok: resp.ok,
+        ms,
+        inChars,
+        outChars,
+        inTok: estTok(inChars),
+        outTok: estTok(outChars),
+      });
+
+      if (!resp.ok) throw new Error(data?.error || "task-planner 실패");
+
+      if (data?.text?.trim()) {
+        setMessages((prev) => [
+          ...prev,
+          { id: crypto.randomUUID(), role: "assistant", content: data.text.trim() },
+        ]);
+      }
+
+      if (data?.plan) {
+        window.dispatchEvent(new CustomEvent("rl:applyPlan", { detail: data.plan }));
+      }
+    } catch (e) {
+      console.error("[task-planner] error:", e);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: `task-planner 오류: ${e instanceof Error ? e.message : String(e)}`,
+        },
+      ]);
+    } finally {
+      setPlannerLoading(false);
+    }
+  }
+
+  // chat submit (intent/motor/execute)
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
@@ -173,10 +328,7 @@ export default function ChatWidget() {
       content: trimmed,
     };
 
-    const historyPayload = messages.map(({ role, content }) => ({
-      role,
-      content,
-    }));
+    const historyPayload = messages.map(({ role, content }) => ({ role, content }));
 
     setMessages((prev) => [...prev, userMessage]);
     setMessage("");
@@ -184,111 +336,194 @@ export default function ChatWidget() {
     setError(null);
 
     try {
-      // ✅ 현재 로드된 URDF 메타를 Planner에 전달 (joint 이름 mismatch 방지 핵심)
       const urdfMeta = getUrdfMetaFromWindowOrDom();
       const context = buildPlannerContext(urdfMeta);
 
-      // 1) Planner 호출
-      const planResponse = await fetch("/api/plan", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          message: trimmed,
-          history: historyPayload,
-          context,
-        }),
+      // 1) intent
+      const intentReqBody = { message: trimmed, history: historyPayload, context };
+      const intentInChars = JSON.stringify(intentReqBody).length;
+      emitAiStage({
+        stage: "intent",
+        phase: "start",
+        inChars: intentInChars,
+        inTok: estTok(intentInChars),
       });
 
-      const planData: PlanResponse = await planResponse.json();
+      const tIntent = performance.now();
+      const intentResp = await fetch("/api/intent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(intentReqBody),
+      });
+      const intentData = (await intentResp.json()) as IntentResponse;
 
-      if (!planResponse.ok) {
-        throw new Error(planData?.error || "모션 플랜을 가져오지 못했습니다.");
+      emitAiStage({
+        stage: "intent",
+        phase: "end",
+        ok: intentResp.ok,
+        ms: Math.round(performance.now() - tIntent),
+        inChars: intentInChars,
+        outChars: JSON.stringify(intentData).length,
+        inTok: estTok(intentInChars),
+        outTok: estTok(JSON.stringify(intentData).length),
+      });
+
+      if (!intentResp.ok) throw new Error(intentData?.error || "명령 해석(intent) 실패");
+
+      const displayText = intentData?.text?.trim();
+      if (displayText) {
+        setMessages((prev) => [
+          ...prev,
+          { id: crypto.randomUUID(), role: "assistant", content: displayText },
+        ]);
       }
 
-      // 2) Planner의 설명 텍스트 표시
-      const displayText = planData?.text?.trim();
-      if (displayText) {
+      // ✅ RL 시작 명령 체크 (motor로 가기 전에 early return)
+      const goalRaw = intentData?.intent?.goal ?? "";
+      const goal = String(goalRaw).toLowerCase();
+
+      const isRLStart =
+        goal === "start_reinforcement_learning" ||
+        goal === "start_reinforcement_learning_for_human" ||
+        goal === "start_reinforcement_learning_for_humanoid" ||
+        goal === "start_reinforcement_learning_for_mujoco" ||
+        goal === "start_reinforcement_learning_session" ||
+        (goal.includes("reinforcement") && goal.includes("learning") && goal.includes("start"));
+
+      if (isRLStart) {
+        window.dispatchEvent(
+          new CustomEvent("rl:startTraining", {
+            detail: {
+              durationMs: intentData?.intent?.duration_ms ?? 15000,
+            },
+          }),
+        );
+
         setMessages((prev) => [
           ...prev,
           {
             id: crypto.randomUUID(),
             role: "assistant",
-            content: displayText,
+            content: "강화학습 트레이닝을 시작합니다. (MuJoCo RL 모드)",
           },
         ]);
+
+        return;
       }
 
-      // 3) 모션 실행기 호출 (+ viewer로 이벤트 전달)
-      if (Array.isArray(planData?.motions) && planData.motions.length > 0) {
-        void (async () => {
-          try {
-            const execResponse = await fetch("/api/execute", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ motions: planData.motions }),
-            });
+      // 2) motor
+      const motorReqBody = { intent: intentData.intent, context, message: trimmed };
+      const motorInChars = JSON.stringify(motorReqBody).length;
+      emitAiStage({
+        stage: "motor",
+        phase: "start",
+        inChars: motorInChars,
+        inTok: estTok(motorInChars),
+      });
 
-            const execData = await execResponse.json().catch(() => null);
+      const tMotor = performance.now();
+      const motorResp = await fetch("/api/motor", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(motorReqBody),
+      });
+      const motorData = (await motorResp.json()) as MotorResponse;
 
-            // ✅ execute 결과(또는 fallback) motions를 viewer로 전달
-            if (execResponse.ok && typeof window !== "undefined") {
-              const finalMotions =
-                (Array.isArray(execData?.motions) && execData.motions.length > 0)
-                  ? execData.motions
-                  : planData.motions;
+      emitAiStage({
+        stage: "motor",
+        phase: "end",
+        ok: motorResp.ok,
+        ms: Math.round(performance.now() - tMotor),
+        inChars: motorInChars,
+        outChars: JSON.stringify(motorData).length,
+        inTok: estTok(motorInChars),
+        outTok: estTok(JSON.stringify(motorData).length),
+      });
 
-              // ✅ 핵심: 이벤트 디스패치 전에 joint 이름을 가능한 경우 실제 URDF joint로 변환
-              const latestMeta = getUrdfMetaFromWindowOrDom() ?? urdfMeta;
-              const available = latestMeta?.availableJoints ?? [];
+      if (!motorResp.ok) throw new Error(motorData?.error || "motor compile 실패");
+      if (!Array.isArray(motorData?.motions) || motorData.motions.length === 0) {
+        throw new Error("motor API가 motions를 반환하지 않았습니다.");
+      }
 
-              const mappedMotions = (available.length > 0)
-                ? finalMotions.map((m: any) => {
-                    const resolved = resolveJointName(m.joint, available, DEFAULT_JOINT_NAME_MAP);
-                    if (!resolved) {
-                      console.warn("[ChatWidget] unresolved joint:", m.joint);
-                      return m; // 변환 실패하면 그대로 전달 (UrdfViewer에서 2차 resolve)
-                    }
-                    if (resolved !== m.joint) {
-                      console.info("[ChatWidget] joint mapped:", m.joint, "->", resolved);
-                    }
-                    return { ...m, joint: resolved };
-                  })
-                : finalMotions;
+      // 3) execute (async)
+      void (async () => {
+        const execReqBody = { motions: motorData.motions, context };
+        const execInChars = JSON.stringify(execReqBody).length;
+        emitAiStage({
+          stage: "execute",
+          phase: "start",
+          inChars: execInChars,
+          inTok: estTok(execInChars),
+        });
 
-              window.dispatchEvent(
-                new CustomEvent("robot:moveJoints", {
-                  detail: {
-                    motions: mappedMotions,
-                    options: {
-                      animate: true,
-                      defaultDurationMs: 350,
-                      // ✅ UrdfViewer에서 2차로 mapping 쓰고 싶으면 같이 전달
-                      jointNameMap: DEFAULT_JOINT_NAME_MAP,
-                    },
-                  },
-                }),
-              );
+        const tExec = performance.now();
+        try {
+          const execResponse = await fetch("/api/execute", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(execReqBody),
+          });
 
-              console.log(
-                "[ChatWidget] 이벤트 발송:",
-                mappedMotions.length,
-                "개 모션",
-                available.length ? `(URDF joints loaded: ${available.length})` : "(URDF joints not ready)",
-              );
-            } else if (!execResponse.ok) {
-              console.warn("[execute] 실패:", execResponse.status, execData);
-            }
-          } catch (e) {
-            console.error("[execute] 에러:", e);
+          const execData: ExecuteResponse | null = await execResponse.json().catch(() => null);
+
+          emitAiStage({
+            stage: "execute",
+            phase: "end",
+            ok: execResponse.ok,
+            ms: Math.round(performance.now() - tExec),
+            inChars: execInChars,
+            outChars: execData ? JSON.stringify(execData).length : 0,
+            inTok: estTok(execInChars),
+            outTok: execData ? estTok(JSON.stringify(execData).length) : 0,
+          });
+
+          if (!execResponse.ok) {
+            console.warn("[execute] failed:", execResponse.status, execData);
+            return;
           }
-        })();
-      }
+
+          const finalMotions =
+            Array.isArray(execData?.motions) && execData!.motions!.length > 0
+              ? execData!.motions!
+              : motorData.motions;
+
+          const latestMeta = getUrdfMetaFromWindowOrDom() ?? urdfMeta;
+          const available = latestMeta?.availableJoints ?? [];
+
+          const mappedMotions =
+            available.length > 0
+              ? finalMotions.map((m: any) => {
+                  const resolved = resolveJointName(m.joint, available, DEFAULT_JOINT_NAME_MAP);
+                  if (!resolved) return m;
+                  return resolved !== m.joint ? { ...m, joint: resolved } : m;
+                })
+              : finalMotions;
+
+          window.dispatchEvent(
+            new CustomEvent("robot:moveJoints", {
+              detail: {
+                motions: mappedMotions,
+                options: {
+                  animate: true,
+                  defaultDurationMs: 350,
+                  jointNameMap: DEFAULT_JOINT_NAME_MAP,
+                },
+              },
+            }),
+          );
+        } catch (e) {
+          emitAiStage({
+            stage: "execute",
+            phase: "end",
+            ok: false,
+            ms: Math.round(performance.now() - tExec),
+          });
+          console.error("[execute] error:", e);
+        }
+      })();
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "알 수 없는 오류가 발생했어요.";
-      setError(message);
+      const msg = err instanceof Error ? err.message : "알 수 없는 오류";
+      setError(msg);
     } finally {
       setIsLoading(false);
     }
@@ -297,9 +532,7 @@ export default function ChatWidget() {
   return (
     <div className="fixed bottom-4 left-4 right-4 z-40 sm:right-auto sm:w-[360px]">
       <div className="rounded-[28px] border border-white/70 bg-white/90 p-5 shadow-[0_24px_60px_rgba(0,0,0,0.15)] backdrop-blur-xl">
-        <h2 className="text-lg font-semibold text-[#1c1c1c]">
-          어디서부터 시작할까요?
-        </h2>
+        <h2 className="text-lg font-semibold text-[#1c1c1c]">어디서부터 시작할까요?</h2>
 
         <div className="mt-4 space-y-3">
           <div className="max-h-64 space-y-2 overflow-y-auto pr-1 text-sm text-[#2f2f2f]">
@@ -311,9 +544,7 @@ export default function ChatWidget() {
               messages.map((item) => (
                 <div
                   key={item.id}
-                  className={`flex ${
-                    item.role === "assistant" ? "justify-start" : "justify-end"
-                  }`}
+                  className={`flex ${item.role === "assistant" ? "justify-start" : "justify-end"}`}
                 >
                   <div
                     className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 shadow-sm ${
@@ -328,10 +559,10 @@ export default function ChatWidget() {
               ))
             )}
 
-            {isLoading && (
+            {(isLoading || plannerLoading) && (
               <div className="flex items-center gap-2 text-xs text-[#7d7256]">
                 <Loader2 className="h-4 w-4 animate-spin" />
-                생각을 정리하고 있어요…
+                {plannerLoading ? "플래너가 다음 목표를 만드는 중…" : "생각을 정리하고 있어요…"}
               </div>
             )}
           </div>
