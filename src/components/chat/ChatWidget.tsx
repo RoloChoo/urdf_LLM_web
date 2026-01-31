@@ -91,6 +91,87 @@ type UrdfMeta = { availableJoints: string[]; jointLimitsRadians: JointLimits };
 const EMPTY_HINT = "LLM 답변은 이 자리에서 바로 확인할 수 있어요.";
 const DEFAULT_JOINT_NAME_MAP: Record<string, string> = {};
 
+// ============================================================
+// ✅ RL 판별 유틸리티 (문서 지침대로 추가)
+// ============================================================
+const RL_GOAL_ALIASES = new Set(
+  [
+    "start_reinforcement_learning",
+    "start_reinforcement_learning_for_human",
+    "start_reinforcement_learning_for_humanoid",
+    "start_reinforcement_learning_for_mujoco",
+    "start_reinforcement_learning_session",
+    "startreinforcementlearning",
+  ].map((value) => value.toLowerCase()),
+);
+
+const RL_GOAL_REGEXES: RegExp[] = [
+  /start\s*(a|the)?\s*reinforcement[-\s]?learning/i,
+  /(reinforcement[-\s]?learning|강화\s*학습).{0,40}(start|시작|실행|launch|train|훈련|학습)/i,
+  /(start|run|train|launch|execute).{0,40}(reinforcement[-\s]?learning|강화\s*학습)/i,
+  /(reinforcement[-\s]?learning|강화\s*학습).{0,40}(walk|walking|gait|locomotion|보행|걷)/i,
+  /(walk|walking|gait|locomotion|보행|걷).{0,40}(reinforcement[-\s]?learning|강화\s*학습)/i,
+];
+
+const RL_MESSAGE_PATTERNS: RegExp[] = [
+  /강화\s*학습.{0,40}(걷|보행|워킹|walking|walk|gait|locomotion).{0,40}(해줘|해주세요|해줘요|시작|실행|훈련|학습|만들어|시키|run|train|start|execute|launch)/i,
+  /(걷|보행|워킹|walking|walk|gait|locomotion).{0,40}강화\s*학습.{0,40}(해줘|해주세요|해줘요|시작|실행|훈련|학습|만들어|시키|run|train|start|execute|launch)/i,
+  /(reinforcement[-\s]?learning|rl).{0,40}(walk|walking|gait|locomotion).{0,40}(start|run|train|training|execute|launch|kick\s*off|please)/i,
+  /(reinforcement[-\s]?learning|강화\s*학습).{0,40}(walk|walking|gait|locomotion|걷|보행|워킹).{0,40}(하고\s*싶|하고싶|싶어|원해|원합니다|하고자)/i,
+];
+
+const RL_NEGATIVE_PATTERNS: RegExp[] = [
+  /설명/, /알려줘/, /알려\s*줘/, /가르쳐/, /가르쳐\s*줘/, /무엇/, /뭐야/, /뭔지/, /예시/, /방법/,
+  /어떻게/, /왜/, /궁금/, /가능해/, /가능할까/, /가능할까요/,
+];
+
+const RL_COMMAND_PATTERNS: RegExp[] = [
+  /(시작|실행|돌려|켜|훈련|학습|만들어|가동|운영).{0,4}해(?:줘|줘요|주세요|줘라)?/,
+  /(run|start|launch|execute|train|training|initiate|kick\s*off).{0,20}(it|this|rl|policy|session|training)/i,
+  /(make|teach).{0,20}(it|the|robot).{0,20}(walk|gait)/i,
+  /(start|run|launch|execute).{0,20}(reinforcement[-\s]?learning|rl)/i,
+  /(reinforcement[-\s]?learning|강화\s*학습).{0,20}(시작|실행|훈련|학습|만들|돌려|켜)/i,
+];
+
+const RL_DESIRE_PATTERNS: RegExp[] = [
+  /(하고\s*싶|하고싶|하고자|싶어|싶다|싶습니다|원해|원합니다|하고\s*싶습니다)/,
+  /(i\s*want|i'd\s*like|i\s*would\s*like|i\s*want\s*to)\s*(start|run|train|learn)/i,
+];
+
+function shouldStartReinforcementLearning(goal: string, userMessage: string): boolean {
+  const rawGoal = (goal ?? "").trim();
+  const lowerGoal = rawGoal.toLowerCase();
+
+  if (RL_GOAL_ALIASES.has(lowerGoal) || RL_GOAL_ALIASES.has(lowerGoal.replace(/\s+/g, ""))) {
+    return true;
+  }
+
+  if (rawGoal && RL_GOAL_REGEXES.some((regex) => regex.test(rawGoal))) {
+    return true;
+  }
+
+  if (!userMessage) return false;
+
+  const normalizedMessage = userMessage.toLowerCase();
+  const hasRlCue = RL_MESSAGE_PATTERNS.some((regex) => regex.test(normalizedMessage));
+  if (!hasRlCue) return false;
+
+  const hasNegative = RL_NEGATIVE_PATTERNS.some((regex) => regex.test(normalizedMessage));
+  const hasCommand = RL_COMMAND_PATTERNS.some((regex) => regex.test(normalizedMessage));
+  const hasDesire = RL_DESIRE_PATTERNS.some((regex) => regex.test(normalizedMessage));
+
+  if (!hasCommand && !hasDesire) {
+    return false;
+  }
+
+  if (hasNegative && !hasCommand) {
+    return false;
+  }
+
+  return true;
+}
+// ============================================================
+
 const normalizeJointKey = (s: string) =>
   s
     .toLowerCase()
@@ -378,19 +459,11 @@ export default function ChatWidget() {
         ]);
       }
 
-      // ✅ RL 시작 명령 체크 (motor로 가기 전에 early return)
+      // ✅ RL 시작 명령 체크 (개선된 로직 적용)
       const goalRaw = intentData?.intent?.goal ?? "";
-      const goal = String(goalRaw).toLowerCase();
+      const shouldStartRl = shouldStartReinforcementLearning(goalRaw, trimmed);
 
-      const isRLStart =
-        goal === "start_reinforcement_learning" ||
-        goal === "start_reinforcement_learning_for_human" ||
-        goal === "start_reinforcement_learning_for_humanoid" ||
-        goal === "start_reinforcement_learning_for_mujoco" ||
-        goal === "start_reinforcement_learning_session" ||
-        (goal.includes("reinforcement") && goal.includes("learning") && goal.includes("start"));
-
-      if (isRLStart) {
+      if (shouldStartRl) {
         window.dispatchEvent(
           new CustomEvent("rl:startTraining", {
             detail: {
