@@ -1,429 +1,92 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import { Play, Pause, RotateCcw, Settings2, Activity, Upload, FileVideo } from "lucide-react";
+import type { JointInfo, SimState } from "@/types/robotControl";
 import { useMujocoScene } from "@/hooks/useMujocoScene";
 import { useRobot } from "@/hooks/useRobot";
-import { RotateCcw, Brain, Loader2, Play } from "lucide-react";
+import { VmdLoader, type VmdKeyframe } from "@/utils/VmdLoader";
+// ▼ [추가] 자동 매핑 유틸리티 임포트
+import { autoMapVmdBonesToMujocoJoints } from "@/utils/autoVmdMujocoMap";
 
-import type { RLTrainingSummary, TaskPlannerPlan } from "@/types/rlTaskPlanner";
-import { RL_EVENTS } from "@/types/rlTaskPlanner";
-
-type EnvResetDonePayload = {
-  obs: ArrayLike<number>;
-  info?: {
-    obsDim?: number;
-    actionDim?: number;
-    baseBodyId?: number;
-    targetHeight?: number;
-    frameSkip?: number;
-    maxSteps?: number;
-    actionMode?: string;
-  };
-};
-
-type EnvStepDonePayload = {
-  obs: ArrayLike<number>;
-  reward: number;
-  terminated: boolean;
-  truncated: boolean;
-  info?: {
-    upright?: number;
-    height?: number;
-    targetHeight?: number;
-    fallHeight?: number;
-    termReason?: string | null;
-    steps?: number;
-    frameSkip?: number;
-  };
-};
-
-function clamp(x: number, lo: number, hi: number) {
-  return Math.min(hi, Math.max(lo, x));
-}
-
-function buildActionFromHint(
-  dim: number,
-  t: number,
-  hint: TaskPlannerPlan["actionHint"] | null,
-  actionMode?: string,
-): Float32Array {
-  if (dim <= 0) return new Float32Array(0);
-
-  const amp0 = hint?.amp ?? 0.75;
-  const speed0 = hint?.speed ?? 1.0;
-
-  const bias =
-    Array.isArray(hint?.bias) && hint!.bias!.length === dim ? hint!.bias! : null;
-  const scale =
-    Array.isArray(hint?.scale) && hint!.scale!.length === dim ? hint!.scale! : null;
-  const phase =
-    Array.isArray(hint?.phase) && hint!.phase!.length === dim ? hint!.phase! : null;
-
-  const out = new Float32Array(dim);
-  for (let i = 0; i < dim; i++) {
-    const ph = phase ? phase[i] : i * 0.6;
-    const sc = scale ? scale[i] : 1.0;
-    const bi = bias ? bias[i] : 0.0;
-
-    let v = Math.sin(t * speed0 + ph) * amp0 * sc + bi;
-
-    if ((actionMode ?? "normalized") === "normalized") {
-      v = clamp(v, -1, 1);
-    }
-
-    out[i] = v;
-  }
-  return out;
-}
-
-export default function MjcfViewer() {
+export default function RobotControlPanel() {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const iframeWindowRef = useRef<Window | null>(null);
 
-  const { registerIframeWindow, resetPose, pauseSimulation, resumeSimulation } =
-    useMujocoScene();
+  const { registerIframeWindow, resetPose, pauseSimulation, resumeSimulation } = useMujocoScene();
+  const { activeRobotType, setActiveRobotType, setActiveRobotOwner, setActiveRobotName } = useRobot();
 
-  const {
-    activeRobotType,
-    setActiveRobotType,
-    setActiveRobotOwner,
-    setActiveRobotName,
-  } = useRobot();
+  const [joints, setJoints] = useState<Record<string, JointInfo>>({});
+  const [simState, setSimState] = useState<SimState>("PAUSED");
+  const [simTime, setSimTime] = useState(0);
+  const [fps, setFps] = useState(0);
+  const [draggingJoint, setDraggingJoint] = useState<string | null>(null);
 
-  const [isTraining, setIsTraining] = useState(false);
-  const isTrainingRef = useRef(false);
-  const [isReplaying, setIsReplaying] = useState(false);
-  const isReplayingRef = useRef(false);
+  // === VMD 관련 상태 ===
+  const [vmdMotion, setVmdMotion] = useState<VmdKeyframe[]>([]);
+  const [isPlayingVmd, setIsPlayingVmd] = useState(false);
+  // ▼ [추가] 매핑된 본 정보를 저장할 상태
+  const [boneMap, setBoneMap] = useState<Record<string, string>>({});
+  
+  const vmdRequestRef = useRef<number>();
+  const vmdStartTimeRef = useRef<number>(0);
 
-  const [trainingProgress, setTrainingProgress] = useState(0);
-  const [trainingLogs, setTrainingLogs] = useState<string[]>([]);
-  const [episodeCount, setEpisodeCount] = useState(0);
-  const [bestReward, setBestReward] = useState<number | null>(null);
-  const [currentReward, setCurrentReward] = useState<number | null>(null);
-  const [lastTrainingSummary, setLastTrainingSummary] = useState<{
-    policyLabel: string;
-    bestReward: number;
-    episodes: number;
-  } | null>(null);
-  const [mockPolicyVersion, setMockPolicyVersion] = useState(1);
-  const [hasReplayPolicy, setHasReplayPolicy] = useState(false);
-
-  const trainingIntervalRef = useRef<number | null>(null);
-  const trainingTimeoutRef = useRef<number | null>(null);
-  const trainingStartRef = useRef<number>(0);
-
-  const rlLoopIntervalRef = useRef<number | null>(null);
-  const rlModeActiveRef = useRef(false);
-
-  // reset 완료 전엔 step을 안 쏘도록
-  const rlEnvReadyRef = useRef(false);
-
-  const rlActionDimRef = useRef(0);
-  const rlEpisodeCountRef = useRef(0);
-  const rlEpisodeReturnRef = useRef(0);
-  const currentPolicyLabelRef = useRef("");
-
-  const episodeCountRef = useRef(0);
-  const bestRewardRef = useRef<number | null>(null);
-  const currentRewardRef = useRef<number | null>(null);
-
-  const bestPolicyRef = useRef<{
-    actions: Float32Array[];
-    frameSkip: number;
-  } | null>(null);
-  const currentEpisodeActionsRef = useRef<Float32Array[]>([]);
-  const currentEpisodeFrameSkipRef = useRef(5);
-
-  const replayTimerRef = useRef<number | null>(null);
-  const replayStateRef = useRef<{
-    actions: Float32Array[];
-    index: number;
-    frameSkip: number;
-  } | null>(null);
-
-  const [highlightedBody, setHighlightedBody] = useState<string | null>(null);
-
-  // RL summary / planner plan state
-  const termReasonCountsRef = useRef<Record<string, number>>({});
-  const lastEnvInfoRef = useRef<{
-    obsDim: number;
-    actionDim: number;
-    baseBodyId?: number;
-    targetHeight?: number;
-    frameSkip: number;
-    maxSteps: number;
-    actionMode?: string;
-  } | null>(null);
-
-  const plannerPlanRef = useRef<TaskPlannerPlan | null>(null);
-
-  const sendIframeMessage = useCallback((payload: Record<string, any>) => {
-    const target = iframeWindowRef.current;
-    if (!target) return;
-    try {
-      target.postMessage(payload, "*");
-    } catch (err) {
-      console.warn("Failed to post message to iframe", err);
-    }
-  }, []);
-
+  // MJCF 로봇 강제 선택
   useEffect(() => {
     if (activeRobotType !== "MJCF") {
       setActiveRobotType("MJCF");
       setActiveRobotOwner("placeholder");
       setActiveRobotName("humanoid");
     }
-  }, [
-    activeRobotType,
-    setActiveRobotType,
-    setActiveRobotOwner,
-    setActiveRobotName,
-  ]);
+  }, [activeRobotType, setActiveRobotName, setActiveRobotOwner, setActiveRobotType]);
 
-  // planner plan 적용 이벤트 수신
-  useEffect(() => {
-    const onApplyPlan = (ev: Event) => {
-      const plan = (ev as CustomEvent<TaskPlannerPlan>).detail;
-      plannerPlanRef.current = plan;
-
-      if (plan?.goal) {
-        setTrainingLogs((prev) => [...prev, `Planner goal: ${plan.goal}`].slice(-12));
-      }
-
-      if (plan?.rlConfig) {
-        sendIframeMessage({ type: "RL_SET_CONFIG", config: plan.rlConfig });
-      }
-    };
-
-    window.addEventListener(RL_EVENTS.applyPlan, onApplyPlan as any);
-    return () => window.removeEventListener(RL_EVENTS.applyPlan, onApplyPlan as any);
-  }, [sendIframeMessage]);
-
-  const stopReplay = useCallback(() => {
-    if (replayTimerRef.current !== null) {
-      window.clearInterval(replayTimerRef.current);
-      replayTimerRef.current = null;
-    }
-    replayStateRef.current = null;
-
-    if (isReplayingRef.current) {
-      isReplayingRef.current = false;
-      setIsReplaying(false);
-      sendIframeMessage({ type: "SET_MODE", mode: "interactive" });
-      resumeSimulation();
-    }
-  }, [resumeSimulation, sendIframeMessage]);
-
-  const stopRlLoop = useCallback(() => {
-    rlEnvReadyRef.current = false;
-    rlActionDimRef.current = 0;
-
-    if (rlLoopIntervalRef.current !== null) {
-      window.clearInterval(rlLoopIntervalRef.current);
-      rlLoopIntervalRef.current = null;
-    }
-    if (rlModeActiveRef.current) {
-      sendIframeMessage({ type: "SET_MODE", mode: "interactive" });
-      rlModeActiveRef.current = false;
-    }
-  }, [sendIframeMessage]);
-
-  const clearTrainingTimers = useCallback(() => {
-    if (trainingIntervalRef.current !== null) {
-      window.clearInterval(trainingIntervalRef.current);
-      trainingIntervalRef.current = null;
-    }
-    if (trainingTimeoutRef.current !== null) {
-      window.clearTimeout(trainingTimeoutRef.current);
-      trainingTimeoutRef.current = null;
-    }
+  const sendMessage = useCallback((msg: any) => {
+    const win = iframeWindowRef.current;
+    if (!win) return;
+    win.postMessage(msg, "*");
   }, []);
 
+  const handleIframeLoad = useCallback(() => {
+    const win = iframeRef.current?.contentWindow ?? null;
+    if (!win) return;
+    iframeWindowRef.current = win;
+    registerIframeWindow(win);
+  }, [registerIframeWindow]);
+
   useEffect(() => {
-    const iframe = iframeRef.current;
-    if (!iframe) return;
-
-    iframe.onerror = (error) => {
-      console.error("[MJCF] iframe load error:", error);
-    };
-
     const handleMessage = (event: MessageEvent) => {
-      if (iframe.contentWindow && event.source === iframe.contentWindow) {
-        iframeWindowRef.current = iframe.contentWindow;
-      }
+      const iframeWin = iframeRef.current?.contentWindow;
+      if (!iframeWin) return;
+      if (event.source !== iframeWin) return;
 
-      switch (event.data?.type) {
-        case "IFRAME_READY": {
-          if (iframe.contentWindow) {
-            iframeWindowRef.current = iframe.contentWindow;
-            registerIframeWindow(iframe.contentWindow);
-          }
+      iframeWindowRef.current = iframeWin;
+      const { type, payload } = event.data ?? {};
+
+      switch (type) {
+        case "IFRAME_READY":
+          registerIframeWindow(iframeWin);
           break;
-        }
-        case "ERROR": {
-          console.error("Iframe error:", event.data.error);
-          break;
-        }
-        case "SCENE_LOADED": {
+        case "SCENE_LOADED":
           resumeSimulation();
+          setSimState("RUNNING");
+          sendMessage({ type: "GET_JOINT_INFO" });
           break;
-        }
-        case "BODY_MOUSEOVER": {
-          setHighlightedBody(event.data.bodyName);
-          break;
-        }
-        case "BODY_MOUSEOUT": {
-          setHighlightedBody(null);
-          break;
-        }
-        case "SET_MODE_DONE": {
-          if (event.data.mode === "interactive") {
-            rlModeActiveRef.current = false;
-            if (!isTrainingRef.current && !isReplayingRef.current) {
-              resumeSimulation();
+        case "SYNC_STATE":
+          if (!payload) return;
+          setSimTime(payload.time ?? 0);
+          setFps(payload.fps ?? 0);
+          
+          setJoints((prev) => {
+            const next = { ...prev };
+            const incoming = (payload.joints ?? {}) as Record<string, JointInfo>;
+            for (const [name, info] of Object.entries(incoming)) {
+              if (draggingJoint !== name) next[name] = info;
             }
-          } else if (event.data.mode === "rl") {
-            rlModeActiveRef.current = true;
-          }
+            return next;
+          });
           break;
-        }
-
-        case "RL_SET_CONFIG_DONE": {
-          setTrainingLogs((prev) => [...prev, "RL config applied"].slice(-12));
-          break;
-        }
-
-        case "ENV_RESET_DONE": {
-          const payload = event.data as EnvResetDonePayload;
-
-          rlEpisodeReturnRef.current = 0;
-          rlActionDimRef.current = payload.info?.actionDim ?? 0;
-          currentEpisodeActionsRef.current = [];
-          currentEpisodeFrameSkipRef.current = payload.info?.frameSkip ?? 5;
-
-          lastEnvInfoRef.current = {
-            obsDim: payload.info?.obsDim ?? 0,
-            actionDim: payload.info?.actionDim ?? 0,
-            baseBodyId: payload.info?.baseBodyId,
-            targetHeight: payload.info?.targetHeight,
-            frameSkip: payload.info?.frameSkip ?? 5,
-            maxSteps: payload.info?.maxSteps ?? 480,
-            actionMode: payload.info?.actionMode,
-          };
-
-          rlEnvReadyRef.current = true;
-
-          if (isTrainingRef.current) {
-            const base = payload.info?.baseBodyId;
-            const th = payload.info?.targetHeight;
-            const ad = rlActionDimRef.current;
-
-            const msg = `[${new Date().toLocaleTimeString()}] Reset env (actionDim=${ad}${
-              base != null ? ` base=${base}` : ""
-            }${th != null ? ` targetH=${Number(th).toFixed(3)}` : ""})`;
-            setTrainingLogs((prev) => [...prev, msg].slice(-12));
-          }
-
-          if (isReplayingRef.current) {
-            const rep = replayStateRef.current;
-            if (rep) {
-              rep.index = 0;
-              if (replayTimerRef.current !== null) {
-                window.clearInterval(replayTimerRef.current);
-              }
-              replayTimerRef.current = window.setInterval(() => {
-                if (!isReplayingRef.current) return;
-                const replay = replayStateRef.current;
-                if (!replay || replay.index >= replay.actions.length) {
-                  stopReplay();
-                  return;
-                }
-                const action = Array.from(replay.actions[replay.index]);
-                sendIframeMessage({ type: "ENV_STEP", action });
-                replay.index += 1;
-              }, 60);
-            }
-          }
-          break;
-        }
-
-        case "ENV_STEP_DONE": {
-          const payload = event.data as EnvStepDonePayload;
-          const reward = Number(payload.reward ?? 0);
-          const info = payload.info ?? {};
-
-          if (isTrainingRef.current) {
-            rlEpisodeReturnRef.current += reward;
-
-            if ((info.steps ?? 0) % 40 === 0) {
-              const stepMsg = `step ${String(info.steps ?? 0).padStart(
-                3,
-                "0",
-              )} | reward=${reward.toFixed(2)} | upright=${(info.upright ?? 0).toFixed(
-                2,
-              )} | reason=${info.termReason ?? "-"}`;
-              setTrainingLogs((prev) => [...prev, stepMsg].slice(-12));
-            }
-
-            if (payload.terminated || payload.truncated) {
-              const tr = String(info.termReason ?? "unknown");
-              termReasonCountsRef.current[tr] = (termReasonCountsRef.current[tr] ?? 0) + 1;
-
-              const episodeReturn = rlEpisodeReturnRef.current;
-              rlEpisodeReturnRef.current = 0;
-
-              rlEpisodeCountRef.current += 1;
-              episodeCountRef.current = rlEpisodeCountRef.current;
-              setEpisodeCount(rlEpisodeCountRef.current);
-
-              currentRewardRef.current = episodeReturn;
-              setCurrentReward(episodeReturn);
-
-              const isNewBest =
-                bestRewardRef.current === null ||
-                episodeReturn > (bestRewardRef.current as number);
-
-              if (isNewBest) {
-                bestRewardRef.current = episodeReturn;
-                setBestReward(episodeReturn);
-                bestPolicyRef.current = {
-                  actions: currentEpisodeActionsRef.current.map((arr) =>
-                    Float32Array.from(arr),
-                  ),
-                  frameSkip: currentEpisodeFrameSkipRef.current,
-                };
-                setHasReplayPolicy(true);
-              }
-
-              const epMsg = `ep ${String(rlEpisodeCountRef.current).padStart(
-                2,
-                "0",
-              )} | return=${episodeReturn.toFixed(2)}${isNewBest ? " *" : ""} | upright=${(
-                info.upright ?? 0
-              ).toFixed(2)} | reason=${info.termReason ?? "-"}`;
-              setTrainingLogs((prev) => [...prev, epMsg].slice(-12));
-
-              currentEpisodeActionsRef.current = [];
-
-              if (isTrainingRef.current) {
-                rlEnvReadyRef.current = false;
-
-                const nextSeed =
-                  (Date.now() + rlEpisodeCountRef.current * 9973) >>> 0;
-
-                sendIframeMessage({
-                  type: "ENV_RESET",
-                  seed: nextSeed,
-                  frameSkip: info.frameSkip ?? currentEpisodeFrameSkipRef.current,
-                });
-              }
-            }
-          }
-
-          break;
-        }
-
-        default:
+        case "ERROR":
+          console.error("[MuJoCo iframe ERROR]", event.data?.error);
           break;
       }
     };
@@ -432,479 +95,219 @@ export default function MjcfViewer() {
     return () => {
       window.removeEventListener("message", handleMessage);
       registerIframeWindow(null);
+      if (vmdRequestRef.current) cancelAnimationFrame(vmdRequestRef.current);
     };
-  }, [registerIframeWindow, resumeSimulation, sendIframeMessage, stopReplay]);
+  }, [draggingJoint, registerIframeWindow, resumeSimulation, sendMessage]);
 
-  const startRlLoop = useCallback(
-    (options: {
-      seed: number;
-      frameSkip: number;
-      maxSteps: number;
-      actionMode: "normalized" | "direct";
-    }) => {
-      rlEnvReadyRef.current = false;
-      rlActionDimRef.current = 0;
-      rlEpisodeCountRef.current = 0;
-      rlEpisodeReturnRef.current = 0;
-      currentEpisodeActionsRef.current = [];
-      currentEpisodeFrameSkipRef.current = options.frameSkip;
+  const handleSliderChange = (name: string, val: number) => {
+    setJoints((prev) => ({ ...prev, [name]: { ...prev[name], val } }));
+    sendMessage({ type: "CONTROL_JOINT", jointName: name, value: val });
+  };
 
-      sendIframeMessage({
-        type: "SET_MODE",
-        mode: "rl",
-        options,
-      });
-
-      const planCfg = plannerPlanRef.current?.rlConfig;
-      if (planCfg) {
-        sendIframeMessage({ type: "RL_SET_CONFIG", config: planCfg });
-      }
-
-      sendIframeMessage({
-        type: "ENV_RESET",
-        ...options,
-      });
-
-      if (rlLoopIntervalRef.current !== null) {
-        window.clearInterval(rlLoopIntervalRef.current);
-      }
-
-      rlLoopIntervalRef.current = window.setInterval(() => {
-        if (!isTrainingRef.current) return;
-        if (!rlEnvReadyRef.current) return;
-
-        const dim = rlActionDimRef.current;
-        const t = performance.now() / 650;
-
-        const hint = plannerPlanRef.current?.actionHint ?? null;
-        const actionMode =
-          plannerPlanRef.current?.rlConfig?.actionMode ??
-          lastEnvInfoRef.current?.actionMode ??
-          options.actionMode;
-
-        const action =
-          dim > 0
-            ? buildActionFromHint(dim, t, hint, actionMode)
-            : new Float32Array(0);
-
-        currentEpisodeActionsRef.current.push(Float32Array.from(action));
-        sendIframeMessage({ type: "ENV_STEP", action: Array.from(action) });
-      }, 60);
-    },
-    [sendIframeMessage],
-  );
-
-  const finalizeTraining = useCallback(
-    (reason: "completed" | "cancelled") => {
-      stopRlLoop();
-      stopReplay();
-      clearTrainingTimers();
-
-      const finalBestRaw =
-        typeof bestRewardRef.current === "number"
-          ? bestRewardRef.current
-          : typeof currentRewardRef.current === "number"
-            ? currentRewardRef.current
-            : 0;
-
-      const finalBest = Number(finalBestRaw.toFixed(2));
-
-      setBestReward(finalBest);
-      setCurrentReward(finalBest);
-      setIsTraining(false);
-      isTrainingRef.current = false;
-      setTrainingProgress(100);
-
-      const tag = reason === "completed" ? "Training session complete" : "Training cancelled";
-      const completionMsg = `[${new Date().toLocaleTimeString()}] ${tag}`;
-      setTrainingLogs((prev) => [...prev, completionMsg].slice(-12));
-
-      setLastTrainingSummary({
-        policyLabel: currentPolicyLabelRef.current,
-        bestReward: finalBest,
-        episodes: rlEpisodeCountRef.current,
-      });
-
-      const env = lastEnvInfoRef.current;
-      const summary: RLTrainingSummary = {
-        when: new Date().toISOString(),
-        policyLabel: currentPolicyLabelRef.current,
-        episodes: rlEpisodeCountRef.current,
-
-        bestReturn: finalBest,
-        lastReturn:
-          typeof currentRewardRef.current === "number" ? currentRewardRef.current : null,
-
-        actionDim: env?.actionDim ?? rlActionDimRef.current ?? 0,
-        obsDim: env?.obsDim ?? 0,
-
-        frameSkip: env?.frameSkip ?? currentEpisodeFrameSkipRef.current ?? 5,
-        maxSteps: env?.maxSteps ?? 480,
-
-        actionMode: env?.actionMode ?? undefined,
-
-        baseBodyId: env?.baseBodyId ?? null,
-        targetHeight: env?.targetHeight ?? null,
-
-        termReasonCounts: { ...termReasonCountsRef.current },
-      };
-
-      termReasonCountsRef.current = {};
-      window.dispatchEvent(new CustomEvent(RL_EVENTS.trainingSummary, { detail: summary }));
-
-      setMockPolicyVersion((prev) => prev + 1);
-
-      bestRewardRef.current = null;
-      currentRewardRef.current = null;
-
-      resumeSimulation();
-    },
-    [clearTrainingTimers, resumeSimulation, stopReplay, stopRlLoop],
-  );
+  // === [추가] 관절 이름이 변경될 때만 자동 매핑 실행 (최적화) ===
+  // joints 객체는 매 프레임 위치값 때문에 갱신되므로, 키(이름) 목록만 문자열로 만들어 비교
+  const jointNamesString = useMemo(() => Object.keys(joints).sort().join(","), [joints]);
 
   useEffect(() => {
-    return () => {
-      stopReplay();
-      stopRlLoop();
-      clearTrainingTimers();
-    };
-  }, [clearTrainingTimers, stopReplay, stopRlLoop]);
+    const robotJointNames = jointNamesString ? jointNamesString.split(",") : [];
+    if (robotJointNames.length === 0) return;
 
-  // ===== TDZ 방지: 아래 useEffect에서 참조하는 콜백들을 먼저 선언 =====
+    // 자동 매핑 실행
+    const { map, unsure } = autoMapVmdBonesToMujocoJoints(robotJointNames);
+    setBoneMap(map);
 
-  const playLearnedPolicy = useCallback(() => {
-    if (isTrainingRef.current || isReplayingRef.current) return;
-    const best = bestPolicyRef.current;
-    if (!best || best.actions.length === 0) return;
+    console.log(`[AutoMap] Mapped ${Object.keys(map).length} bones.`);
+    
+    if (unsure.length > 0) {
+      console.warn("[AutoMap] Unsure mappings (check console):", unsure);
+      // 추후 여기서 사용자에게 수동 매핑 모달을 띄울 수 있음
+    }
+  }, [jointNamesString]);
 
-    stopReplay();
-    stopRlLoop();
-    pauseSimulation();
+  // === VMD 업로드 핸들러 ===
+  const handleVmdUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
 
-    setIsReplaying(true);
-    isReplayingRef.current = true;
+    try {
+      const buffer = await file.arrayBuffer();
+      const robotJointNames = Object.keys(joints);
+      
+      // ▼ [변경] boneMap 옵션 전달
+      const motion = VmdLoader.load(buffer, robotJointNames, { boneMap });
+      
+      setVmdMotion(motion);
+      console.log(`✅ Loaded VMD: ${motion.length} keyframes`);
+      
+      startVmdPlayback(motion);
+    } catch (err) {
+      console.error("VMD Load Failed:", err);
+      alert("VMD 파일을 읽는데 실패했습니다. (콘솔 확인)");
+    }
+  };
 
-    replayStateRef.current = {
-      actions: best.actions.map((arr) => Float32Array.from(arr)),
-      index: 0,
-      frameSkip: best.frameSkip,
-    };
+  // === VMD 재생 루프 ===
+  const startVmdPlayback = (motion: VmdKeyframe[]) => {
+    if (motion.length === 0) return;
+    
+    setIsPlayingVmd(true);
+    setSimState("RUNNING");
+    sendMessage({ type: "RESUME_SIMULATION" });
 
-    sendIframeMessage({
-      type: "SET_MODE",
-      mode: "rl",
-      options: { frameSkip: best.frameSkip, maxSteps: best.actions.length },
-    });
+    vmdStartTimeRef.current = performance.now();
 
-    const planCfg = plannerPlanRef.current?.rlConfig;
-    if (planCfg) sendIframeMessage({ type: "RL_SET_CONFIG", config: planCfg });
+    const loop = () => {
+      const now = performance.now();
+      const elapsed = (now - vmdStartTimeRef.current) / 1000; 
+      const currentFrame = elapsed * 30; // VMD 30fps 기준
 
-    sendIframeMessage({
-      type: "ENV_RESET",
-      seed: Date.now() >>> 0,
-      frameSkip: best.frameSkip,
-    });
-  }, [pauseSimulation, sendIframeMessage, stopReplay, stopRlLoop]);
+      const keyframe = motion.find(k => k.frame >= currentFrame);
 
-  const startFakeTraining = useCallback(
-    (durationMs?: number) => {
-      if (isTrainingRef.current || isReplayingRef.current) return;
+      if (!keyframe) {
+        vmdStartTimeRef.current = now; // 반복 재생
+        vmdRequestRef.current = requestAnimationFrame(loop);
+        return;
+      }
 
-      clearTrainingTimers();
-      stopReplay();
-      stopRlLoop();
-      pauseSimulation();
+      // 관절 명령 전송
+      Object.entries(keyframe.pose).forEach(([jointName, angle]) => {
+        sendMessage({ type: "CONTROL_JOINT", jointName, value: angle });
+        
+        setJoints(prev => {
+            if (!prev[jointName]) return prev;
+            return { ...prev, [jointName]: { ...prev[jointName], val: angle } };
+        });
+      });
 
-      const policyLabel = `MockPPO-v${mockPolicyVersion}`;
-      currentPolicyLabelRef.current = policyLabel;
-
-      // ✅ ChatWidget에서 넘어온 durationMs 반영
-      const TRAINING_DURATION_MS =
-        typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs > 0
-          ? Math.min(10 * 60_000, Math.max(3_000, Math.round(durationMs)))
-          : 15_000;
-
-      bestPolicyRef.current = null;
-      setHasReplayPolicy(false);
-
-      isTrainingRef.current = true;
-      setIsTraining(true);
-      setTrainingProgress(0);
-      setLastTrainingSummary(null);
-
-      termReasonCountsRef.current = {};
-
-      episodeCountRef.current = 0;
-      rlEpisodeCountRef.current = 0;
-      rlEpisodeReturnRef.current = 0;
-      setEpisodeCount(0);
-
-      bestRewardRef.current = null;
-      setBestReward(null);
-      currentRewardRef.current = null;
-      setCurrentReward(null);
-
-      const nowLabel = new Date().toLocaleTimeString();
-      setTrainingLogs([
-        `[${nowLabel}] Switching to RL stand task`,
-        `[${nowLabel}] Requesting environment reset...`,
-      ]);
-
-      trainingStartRef.current = performance.now();
-
-      const planCfg = plannerPlanRef.current?.rlConfig;
-
-      const rlOptions = {
-        seed: Date.now() >>> 0,
-        frameSkip: typeof planCfg?.frameSkip === "number" ? planCfg.frameSkip : 5,
-        maxSteps: typeof planCfg?.maxSteps === "number" ? planCfg.maxSteps : 480,
-        actionMode: (planCfg?.actionMode === "direct" ? "direct" : "normalized") as const,
-      };
-
-      startRlLoop(rlOptions);
-
-      trainingIntervalRef.current = window.setInterval(() => {
-        const elapsed = performance.now() - trainingStartRef.current;
-        const pct = Math.min(100, Math.round((elapsed / TRAINING_DURATION_MS) * 100));
-        setTrainingProgress(pct);
-
-        if (elapsed >= TRAINING_DURATION_MS) {
-          window.clearInterval(trainingIntervalRef.current ?? undefined);
-          trainingIntervalRef.current = null;
-
-          trainingTimeoutRef.current = window.setTimeout(() => {
-            finalizeTraining("completed");
-          }, 600);
-        }
-      }, 450);
-    },
-    [
-      clearTrainingTimers,
-      finalizeTraining,
-      mockPolicyVersion,
-      pauseSimulation,
-      startRlLoop,
-      stopReplay,
-      stopRlLoop,
-    ],
-  );
-
-  // ✅ LLM chat -> RL control events
-  useEffect(() => {
-    const onStart = (ev: Event) => {
-      const detail = (ev as CustomEvent<{ durationMs?: number }>).detail;
-      startFakeTraining(detail?.durationMs);
+      vmdRequestRef.current = requestAnimationFrame(loop);
     };
 
-    const onStop = () => {
-      if (isTrainingRef.current) finalizeTraining("cancelled");
-    };
+    if (vmdRequestRef.current) cancelAnimationFrame(vmdRequestRef.current);
+    vmdRequestRef.current = requestAnimationFrame(loop);
+  };
 
-    const onReplay = () => {
-      playLearnedPolicy();
-    };
-
-    window.addEventListener("rl:startTraining", onStart as any);
-    window.addEventListener("rl:stopTraining", onStop as any);
-    window.addEventListener("rl:replayPolicy", onReplay as any);
-
-    return () => {
-      window.removeEventListener("rl:startTraining", onStart as any);
-      window.removeEventListener("rl:stopTraining", onStop as any);
-      window.removeEventListener("rl:replayPolicy", onReplay as any);
-    };
-  }, [finalizeTraining, playLearnedPolicy, startFakeTraining]);
-
-  const activePolicyLabel = isTraining
-    ? currentPolicyLabelRef.current || `MockPPO-v${mockPolicyVersion}`
-    : lastTrainingSummary?.policyLabel ?? `MockPPO-v${mockPolicyVersion}`;
-
-  const displayedEpisodes = isTraining
-    ? episodeCount
-    : lastTrainingSummary?.episodes ?? episodeCount;
-
-  const bestRewardValue = isTraining
-    ? bestReward ?? currentReward ?? (episodeCount > 0 ? 0 : null)
-    : lastTrainingSummary?.bestReward ?? bestReward;
-
-  const lastRewardValue = isTraining
-    ? currentReward
-    : lastTrainingSummary?.bestReward ?? currentReward;
-
-  const bestRewardDisplay =
-    typeof bestRewardValue === "number" ? bestRewardValue.toFixed(2) : "–";
-
-  const lastRewardDisplay =
-    typeof lastRewardValue === "number" ? lastRewardValue.toFixed(2) : "–";
-
-  const trainingButtonLabel = isTraining
-    ? "Training..."
-    : lastTrainingSummary
-      ? "Retrain Policy"
-      : "Mock Train";
+  const stopVmd = () => {
+    if (vmdRequestRef.current) cancelAnimationFrame(vmdRequestRef.current);
+    setIsPlayingVmd(false);
+  };
 
   return (
-    <div className="w-full h-full flex flex-row relative">
-      <div
-        style={{
-          width: "100%",
-          height: "100%",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          background: "var(--mujoco-scene-bg)",
-          boxShadow: "2px 0 8px rgba(0,0,0,0.04)",
-          position: "relative",
-          zIndex: 1,
-        }}
-      >
+    <div className="w-full h-full flex flex-row bg-[#1e1e1e] text-[#e8e8e8]">
+      <div className="flex-grow relative border-r border-[#3a3a3a] min-h-0">
         <iframe
           ref={iframeRef}
-          src={"/mujoco/mujoco.html"}
+          src="/mujoco/mujoco.html"
+          onLoad={handleIframeLoad}
           sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads"
-          style={{
-            width: "100%",
-            height: "100%",
-            margin: 0,
-            padding: 0,
-            border: "none",
-            display: "block",
-            background: "var(--mujoco-scene-bg)",
-            borderRadius: "12px",
-          }}
-          title="MuJoCo Physics Viewer"
-          loading="lazy"
-          referrerPolicy="no-referrer"
+          className="w-full h-full border-none block bg-[#181818]"
+          title="MuJoCo Viewer"
         />
-
-        {(isTraining || lastTrainingSummary || trainingLogs.length > 0) && (
-          <div className="absolute top-3 left-3 z-10 w-[260px] text-[#5d4a0a]">
-            <div className="space-y-2 rounded-xl border border-[#e7d7aa] bg-[#fff8e3]/95 p-3 shadow-sm backdrop-blur-sm">
-              <div className="flex items-center justify-between text-xs font-mono">
-                <span className="flex items-center gap-1">
-                  <Brain size={14} className="text-[#7d6420]" />
-                  Mock RL Console
-                </span>
-                {isTraining ? (
-                  <span className="flex items-center gap-1 text-[#967b1e]">
-                    <Loader2 size={12} className="animate-spin" />
-                    training
-                  </span>
-                ) : isReplaying ? (
-                  <span className="text-[#967b1e]">replay</span>
-                ) : lastTrainingSummary ? (
-                  <span className="text-[#967b1e]">ready</span>
-                ) : null}
-              </div>
-
-              <div className="space-y-1 text-[11px] font-mono text-[#7d6a1e]">
-                <div className="flex items-center justify-between">
-                  <span>Policy</span>
-                  <span>{activePolicyLabel}</span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span>Episodes</span>
-                  <span>{displayedEpisodes}</span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span>Best return</span>
-                  <span>{bestRewardDisplay}</span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span>Last return</span>
-                  <span>{lastRewardDisplay}</span>
-                </div>
-              </div>
-
-              {isTraining && (
-                <div className="space-y-1 pt-1">
-                  <div className="flex items-center justify-between text-[10px] uppercase tracking-wide text-[#a78628]">
-                    <span>progress</span>
-                    <span>{trainingProgress}%</span>
-                  </div>
-                  <div className="h-2 overflow-hidden rounded-full bg-[#f1e1b8]">
-                    <div
-                      className="h-full bg-[#c4a63b] transition-all duration-300 ease-out"
-                      style={{ width: `${trainingProgress}%` }}
-                    />
-                  </div>
-                </div>
-              )}
-
-              <div>
-                <div className="text-[10px] uppercase tracking-wide text-[#a78628]">
-                  logs
-                </div>
-                <div className="mt-1 max-h-28 overflow-hidden rounded-md border border-[#ead9aa] bg-[#fffbea]/80 px-2 py-1.5">
-                  {trainingLogs.length > 0 ? (
-                    <ul className="space-y-1 text-[11px] leading-relaxed">
-                      {trainingLogs.slice(-6).map((log, index) => (
-                        <li key={`${index}-${log}`} className="truncate">
-                          {log}
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <div className="text-[11px] text-[#b29c5b]">Awaiting training…</div>
-                  )}
-                </div>
-              </div>
-            </div>
+        {/* HUD */}
+        <div className="absolute top-4 left-4 flex gap-4 text-xs font-mono bg-black/60 p-2 rounded text-[#888]">
+          <div className="flex items-center gap-2">
+            <Activity size={14} className={simState === "RUNNING" ? "text-green-500" : "text-yellow-500"} />
+            <span>{simState}</span>
           </div>
-        )}
+          <div>TIME: {simTime.toFixed(2)}s</div>
+          <div>FPS: {fps}</div>
+          {isPlayingVmd && <div className="text-[#4CAF50] font-bold">VMD PLAYING</div>}
+        </div>
+      </div>
 
-        <button
-          onClick={resetPose}
-          aria-label="Reset Pose"
-          className="absolute top-3 right-3 z-10 bg-[#fefbf1] border-none rounded-lg p-2 cursor-pointer hover:bg-[#fefbf1]/80 transition-all"
-        >
-          <RotateCcw size={22} className="text-[#968612]" />
-        </button>
-
-        <div className="absolute bottom-4 left-4 z-10 flex gap-2">
-          <button
-            onClick={() => startFakeTraining()}
-            disabled={isTraining || isReplaying}
-            aria-label="Run mock training"
-            className={`flex items-center justify-center gap-2 rounded-lg border-none p-2 font-mono text-sm transition-all ${
-              isTraining || isReplaying
-                ? "cursor-not-allowed bg-[#f2e6c2] text-[#a18a3d] opacity-70"
-                : "cursor-pointer bg-[#fef4da] text-[#9b8632] hover:bg-[#f8eab5]"
-            }`}
-          >
-            {isTraining ? (
-              <Loader2 size={17} className="animate-spin text-[#967b1e]" />
-            ) : (
-              <Brain size={17} className="text-[#967b1e]" />
-            )}
-            {trainingButtonLabel}
-          </button>
-
-          <button
-            onClick={playLearnedPolicy}
-            disabled={!hasReplayPolicy || isTraining || isReplaying}
-            aria-label="Replay learned policy"
-            className={`flex items-center justify-center gap-2 rounded-lg border border-[#e6d6a0] p-2 font-mono text-sm transition-all ${
-              !hasReplayPolicy || isTraining || isReplaying
-                ? "cursor-not-allowed bg-[#f8edd1] text-[#b59a4e] opacity-60"
-                : "cursor-pointer bg-[#fffdf2] text-[#9d8530] hover:bg-[#f8edd1]"
-            }`}
-          >
-            {isReplaying ? (
-              <Loader2 size={16} className="animate-spin text-[#8a731d]" />
-            ) : (
-              <Play size={16} className="text-[#8a731d]" />
-            )}
-            {isReplaying ? "Replaying..." : "Replay Policy"}
-          </button>
+      {/* 우측 패널 */}
+      <div className="w-[320px] flex flex-col bg-[#252525] min-h-0">
+        <div className="h-10 bg-[#353535] flex items-center justify-center border-b border-[#3a3a3a]">
+          <span className="font-bold text-sm flex items-center gap-2">
+            <Settings2 size={16} /> Robot Control
+          </span>
         </div>
 
-        {highlightedBody && (
-          <div className="font-mono absolute bottom-4 right-4 text-[#9b8632] px-3 py-2 rounded-md text-sm z-10 flex items-center gap-2">
-            <span className="opacity-80">hover:</span>
-            {highlightedBody}
+        {/* 제어 버튼 영역 */}
+        <div className="p-4 border-b border-[#3a3a3a] space-y-3">
+          <div className="grid grid-cols-3 gap-2">
+            <button
+              onClick={() => { resumeSimulation(); setSimState("RUNNING"); }}
+              className={`p-2 rounded flex items-center justify-center gap-2 text-xs font-bold transition-all ${
+                simState === "RUNNING" ? "bg-[#4CAF50] text-white" : "bg-[#2a2a2a] hover:bg-[#404040]"
+              }`}
+            >
+              <Play size={14} /> PLAY
+            </button>
+            <button
+              onClick={() => { pauseSimulation(); setSimState("PAUSED"); stopVmd(); }}
+              className={`p-2 rounded flex items-center justify-center gap-2 text-xs font-bold transition-all ${
+                simState === "PAUSED" ? "bg-[#FF9800] text-white" : "bg-[#2a2a2a] hover:bg-[#404040]"
+              }`}
+            >
+              <Pause size={14} /> PAUSE
+            </button>
+            <button
+              onClick={() => { resetPose(); setSimState("PAUSED"); setSimTime(0); stopVmd(); }}
+              className="p-2 rounded flex items-center justify-center gap-2 text-xs font-bold bg-[#2a2a2a] hover:bg-[#F44336] transition-all"
+            >
+              <RotateCcw size={14} /> RESET
+            </button>
           </div>
-        )}
+
+          {/* VMD 업로드 버튼 */}
+          <div>
+            <input 
+              type="file" 
+              accept=".vmd" 
+              id="vmd-upload" 
+              className="hidden" 
+              onChange={handleVmdUpload}
+            />
+            <label 
+              htmlFor="vmd-upload"
+              className={`flex items-center justify-center gap-2 p-2 text-xs border rounded cursor-pointer transition-all ${
+                isPlayingVmd 
+                  ? "bg-[#2a2a2a] border-[#4CAF50] text-[#4CAF50]" 
+                  : "bg-[#2a2a2a] text-[#e8e8e8] border-[#444] hover:bg-[#404040]"
+              }`}
+            >
+              {isPlayingVmd ? <FileVideo size={14} /> : <Upload size={14} />}
+              {vmdMotion.length > 0 ? `Playing VMD (${vmdMotion.length} frames)` : "Load VMD File"}
+            </label>
+            {/* 매핑 상태 표시 (간단히) */}
+            {Object.keys(boneMap).length > 0 && (
+              <div className="text-[10px] text-center mt-1 text-gray-500">
+                 Auto-mapped {Object.keys(boneMap).length} joints
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* 관절 리스트 */}
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          <div className="text-xs text-[#888] font-mono mb-2">JOINTS ({Object.keys(joints).length})</div>
+          {Object.entries(joints).map(([name, info]) => (
+            <div key={name} className="bg-[#2a2a2a] p-3 rounded border border-[#3a3a3a]">
+              <div className="flex justify-between items-center mb-2">
+                <span className="text-xs font-bold text-[#e8e8e8] truncate w-24" title={name}>{name}</span>
+                <span className="text-[10px] font-mono text-[#4CAF50]">{info.val.toFixed(3)} rad</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] text-[#555]">{info.min.toFixed(1)}</span>
+                <input
+                  type="range"
+                  min={info.min}
+                  max={info.max}
+                  step={0.01}
+                  value={info.val}
+                  onPointerDown={() => setDraggingJoint(name)}
+                  onPointerUp={() => setDraggingJoint(null)}
+                  onChange={(e) => handleSliderChange(name, parseFloat(e.target.value))}
+                  className="flex-1 h-1 bg-[#404040] rounded-lg appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-[#4CAF50] [&::-webkit-slider-thumb]:rounded-full"
+                />
+                <span className="text-[10px] text-[#555]">{info.max.toFixed(1)}</span>
+              </div>
+            </div>
+          ))}
+          {Object.keys(joints).length === 0 && (
+            <div className="text-center text-[#555] text-xs py-10">No joints loaded.</div>
+          )}
+        </div>
       </div>
     </div>
   );
