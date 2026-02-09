@@ -1,54 +1,60 @@
-import { Quaternion, Euler } from "three";
+import { Quaternion, Euler, MathUtils } from "three";
 
-// 기본 VMD 본 이름 → URDF 조인트 후보 매핑 테이블
+// =========================================================
+// 🗺️ [매핑 정답지] Java 코드의 VMD_TO_URDF 100% 이식
+// =========================================================
 const VMD_TO_URDF: { [key: string]: string[] } = {
-  // ===== 몸통 =====
-  "センター": ["base_link", "hips", "pelvis", "torso", "root"],
-  "下半身": ["lower_body", "hips", "pelvis"],
-  "上半身": ["spine", "torso", "chest"],
-  "上半身2": ["upper_chest", "chest", "spine1", "spine2"],
-  "首": ["neck", "head_pan"],
-  "頭": ["head", "head_tilt"],
+  // ===== 몸통/척추 =====
+  "センター": ["torso", "Hips", "hips", "Pelvis", "pelvis", "base_link"],
+  "下半身": ["hip", "Hips", "hips", "Pelvis", "pelvis", "lower_body"],
+  "上半身": ["torso", "Spine", "spine", "Torso", "chest"],
+  "上半身2": ["chest", "Chest", "Spine1", "Spine2", "upper_chest"],
+
+  // ===== 머리/목 =====
+  "首": ["head_pan", "Neck", "neck", "HeadYaw", "head_yaw"],
+  "頭": ["head_tilt", "Head", "head", "HeadPitch", "head_pitch"],
 
   // ===== 왼팔 =====
-  "左肩": ["l_shoulder_pitch", "left_shoulder_pitch", "l_sho_pitch", "LShoulderPitch"],
-  "左腕": ["l_shoulder_roll", "left_shoulder_roll", "l_sho_roll", "LShoulderRoll"],
-  "左ひじ": ["l_elbow", "left_elbow", "l_el", "LElbow"],
-  "左手首": ["l_wrist", "left_wrist", "LWrist"],
+  "左肩": ["l_sho_pitch", "LShoulderPitch", "LeftShoulder", "left_shoulder_pitch", "l_shoulder_pitch"],
+  "左腕": ["l_sho_roll", "LShoulderRoll", "LeftUpperArm", "left_shoulder_roll", "l_shoulder_roll"],
+  "左ひじ": ["l_el", "LElbowYaw", "LElbowRoll", "LeftLowerArm", "left_elbow", "l_elbow"],
+  "左手首": ["l_wrist", "LWristYaw", "LeftHand", "left_wrist", "l_wrist_yaw"],
 
   // ===== 오른팔 =====
-  "右肩": ["r_shoulder_pitch", "right_shoulder_pitch", "r_sho_pitch", "RShoulderPitch"],
-  "右腕": ["r_shoulder_roll", "right_shoulder_roll", "r_sho_roll", "RShoulderRoll"],
-  "右ひじ": ["r_elbow", "right_elbow", "r_el", "RElbow"],
-  "右手首": ["r_wrist", "right_wrist", "RWrist"],
+  "右肩": ["r_sho_pitch", "RShoulderPitch", "RightShoulder", "right_shoulder_pitch", "r_shoulder_pitch"],
+  "右腕": ["r_sho_roll", "RShoulderRoll", "RightUpperArm", "right_shoulder_roll", "r_shoulder_roll"],
+  "右ひじ": ["r_el", "RElbowYaw", "RElbowRoll", "RightLowerArm", "right_elbow", "r_elbow"],
+  "右手首": ["r_wrist", "RWristYaw", "RightHand", "right_wrist", "r_wrist_yaw"],
 
-  // ===== 다리 =====
-  "左足": ["l_hip_pitch", "left_hip_pitch", "l_leg", "LHip"],
-  "左ひざ": ["l_knee", "left_knee", "LKnee"],
-  "左足首": ["l_ankle_pitch", "left_ankle_pitch", "LAnkle"],
+  // ===== 왼다리 =====
+  "左足": ["l_hip_yaw", "l_hip_pitch", "LHipYawPitch", "LHipPitch", "LeftUpLeg", "left_hip", "l_leg"],
+  "左ひざ": ["l_knee", "LKneePitch", "LeftLeg", "left_knee", "l_knee_pitch"],
+  "左足首": ["l_ank_pitch", "LAnklePitch", "LeftFoot", "left_ankle", "l_ankle"],
+  "左つま先": ["l_ank_roll", "LAnkleRoll", "LeftToeBase", "left_toe", "l_toe"],
 
-  "右足": ["r_hip_pitch", "right_hip_pitch", "r_leg", "RHip"],
-  "右ひざ": ["r_knee", "right_knee", "RKnee"],
-  "右足首": ["r_ankle_pitch", "right_ankle_pitch", "RAnkle"],
+  // ===== 오른다리 =====
+  "右足": ["r_hip_yaw", "r_hip_pitch", "RHipYawPitch", "RHipPitch", "RightUpLeg", "right_hip", "r_leg"],
+  "右ひざ": ["r_knee", "RKneePitch", "RightLeg", "right_knee", "r_knee_pitch"],
+  "右足首": ["r_ank_pitch", "RAnklePitch", "RightFoot", "right_ankle", "r_ankle"],
+  "右つま先": ["r_ank_roll", "RAnkleRoll", "RightToeBase", "right_toe", "r_toe"],
+
+  // ===== IK 본 (참고용) =====
+  "左足ＩＫ": ["l_ank_pitch", "LAnklePitch", "LeftFoot"],
+  "右足ＩＫ": ["r_ank_pitch", "RAnklePitch", "RightFoot"],
+  "左つま先ＩＫ": ["l_ank_roll", "LAnkleRoll", "LeftToeBase"],
+  "右つま先ＩＫ": ["r_ank_roll", "RAnkleRoll", "RightToeBase"],
 };
 
 export type VmdKeyframe = {
   frame: number;
-  pose: { [key: string]: number }; // { "joint_name": angle }
+  pose: { [key: string]: number };
 };
 
 export type VmdLoaderOptions = {
-  boneMap?: Record<string, string>; // VMD 본 이름 → URDF 조인트 이름 직접 매핑
+  boneMap?: Record<string, string>;
 };
 
 export class VmdLoader {
-  /**
-   * VMD 파일을 로드하여 키프레임 배열로 변환
-   * @param buffer VMD 파일의 ArrayBuffer
-   * @param robotJointNames 로봇의 조인트 이름 목록
-   * @param opts 옵션 (boneMap: 외부에서 제공하는 본 매핑 테이블)
-   * @returns VmdKeyframe 배열
-   */
   static load(
     buffer: ArrayBuffer,
     robotJointNames: string[],
@@ -58,128 +64,133 @@ export class VmdLoader {
     const decoder = new TextDecoder("shift-jis");
     let offset = 0;
 
-    // VMD 파일 헤더 검증
+    // 헤더 파싱
     const magicBytes = new Uint8Array(buffer, 0, 30);
     const magic = decoder.decode(magicBytes).replace(/\0/g, "").trim();
     if (!magic.startsWith("Vocaloid Motion Data")) {
       throw new Error("Invalid VMD file");
     }
-    offset += 30 + 20;
+    offset += 50; // Magic(30) + ModelName(20)
 
-    // 모션 데이터 개수 읽기
     const motionCount = data.getUint32(offset, true);
     offset += 4;
 
-    const frames: VmdKeyframe[] = [];
     const frameMap: { [frame: number]: { [joint: string]: number } } = {};
 
-    // 각 모션 데이터 파싱
     for (let i = 0; i < motionCount; i++) {
-      // 본 이름 읽기 (15바이트)
+      // 본 이름
       const boneNameBytes = new Uint8Array(buffer, offset, 15);
       const boneName = decoder.decode(boneNameBytes).replace(/\0/g, "").trim();
       offset += 15;
 
-      // 프레임 번호 읽기
+      // 프레임 번호
       const frameNum = data.getUint32(offset, true);
       offset += 4;
 
-      // 위치 데이터 건너뛰기 (12바이트)
+      // 위치 (Skip)
       offset += 12;
 
-      // 쿼터니언 읽기
+      // 회전 (Quaternion)
       const qx = data.getFloat32(offset, true);
-      offset += 4;
-      const qy = data.getFloat32(offset, true);
-      offset += 4;
-      const qz = data.getFloat32(offset, true);
-      offset += 4;
-      const qw = data.getFloat32(offset, true);
-      offset += 4;
+      const qy = data.getFloat32(offset + 4, true);
+      const qz = data.getFloat32(offset + 8, true);
+      const qw = data.getFloat32(offset + 12, true);
+      offset += 16;
 
-      // 보간 데이터 건너뛰기 (64바이트)
+      // 보간 (Skip)
       offset += 64;
 
-      // ✅ 1순위: 외부에서 제공한 boneMap 사용
-      const mapped = opts?.boneMap?.[boneName];
-      if (mapped && robotJointNames.includes(mapped)) {
-        const angle = this.convertToUrdfAngle(boneName, qx, qy, qz, qw);
-        if (!frameMap[frameNum]) frameMap[frameNum] = {};
-        frameMap[frameNum][mapped] = angle;
-        continue;
+      // 매핑 확인
+      let targetJoint: string | undefined = opts?.boneMap?.[boneName];
+      if (!targetJoint) {
+        const candidates = VMD_TO_URDF[boneName];
+        if (candidates) {
+          targetJoint = this.findMatchingJoint(candidates, robotJointNames) || undefined;
+        }
       }
 
-      // ✅ 2순위: 기본 VMD_TO_URDF 매핑 테이블 사용 (백업)
-      const candidates = VMD_TO_URDF[boneName];
-      if (!candidates) continue;
-
-      const targetJoint = this.findMatchingJoint(candidates, robotJointNames);
       if (targetJoint) {
+        // 순수 Java 로직 기반 변환 (보정 없음)
         const angle = this.convertToUrdfAngle(boneName, qx, qy, qz, qw);
+        
         if (!frameMap[frameNum]) frameMap[frameNum] = {};
         frameMap[frameNum][targetJoint] = angle;
       }
     }
 
-    // 프레임 번호 순으로 정렬하여 키프레임 배열 생성
-    const sortedFrames = Object.keys(frameMap)
+    // 정렬
+    return Object.keys(frameMap)
       .map(Number)
-      .sort((a, b) => a - b);
-
-    for (const f of sortedFrames) {
-      frames.push({ frame: f, pose: frameMap[f] });
-    }
-
-    return frames;
+      .sort((a, b) => a - b)
+      .map(f => ({ frame: f, pose: frameMap[f] }));
   }
 
-  /**
-   * 후보 조인트 이름 목록에서 로봇 조인트와 매칭되는 것 찾기
-   */
   private static findMatchingJoint(candidates: string[], robotJoints: string[]): string | null {
     for (const cand of candidates) {
-      // 정확히 일치하는 조인트
       if (robotJoints.includes(cand)) return cand;
-      
-      // 대소문자 무시하고 일치하는 조인트
-      const found = robotJoints.find(rj => rj.toLowerCase() === cand.toLowerCase());
-      if (found) return found;
-      
-      // 부분 문자열로 포함하는 조인트
-      const foundPart = robotJoints.find(rj => rj.toLowerCase().includes(cand.toLowerCase()));
-      if (foundPart) return foundPart;
+      const exactMatch = robotJoints.find(rj => rj.toLowerCase() === cand.toLowerCase());
+      if (exactMatch) return exactMatch;
+      const partialMatch = robotJoints.find(rj => rj.toLowerCase().includes(cand.toLowerCase()));
+      if (partialMatch) return partialMatch;
     }
     return null;
   }
 
   /**
-   * VMD 쿼터니언을 URDF 각도로 변환
-   * (본 이름에 따라 축 방향 및 오프셋 조정)
+   * 🔥 [Pure Logic] Java 코드를 그대로 TS로 번역
+   * 인위적인 오프셋(KNEE_BEND 등) 제거됨.
    */
   private static convertToUrdfAngle(boneName: string, x: number, y: number, z: number, w: number): number {
     const q = new Quaternion(x, y, z, w);
     const e = new Euler().setFromQuaternion(q, "XYZ");
-
-    // 팔 (腕)
-    if (boneName.includes("腕")) {
-      return boneName.includes("左") ? e.z + 0.5 : e.z - 0.5;
-    }
     
-    // 팔꿈치 (ひじ)
-    if (boneName.includes("ひじ")) {
-      return boneName.includes("左") ? -Math.abs(e.x) : Math.abs(e.x);
-    }
+    // Java 코드의 Math.toRadians(30) 같은 상수만 남김
+    const A_POSE_OFFSET = MathUtils.degToRad(30);
 
-    // 다리 (足, 발목 제외)
-    if (boneName.includes("足") && !boneName.includes("首")) {
-      return -e.x;
-    }
+    switch (boneName) {
+      // ===== 머리 (Java: -euler.y / -euler.x) =====
+      case "首": return -e.y;
+      case "頭": return -e.x;
 
-    // 무릎 (ひざ)
-    if (boneName.includes("ひざ")) {
-      return Math.abs(e.x);
-    }
+      // ===== 어깨 (Java: -euler.x) =====
+      case "左肩":
+      case "右肩": return -e.x;
 
-    return e.z;
+      // ===== 팔 (Java: euler.z +/- 30deg) =====
+      // *참고: Java 코드에 30도 오프셋이 있어서 이건 남겨둠 (A-Pose 보정용)
+      case "左腕": return e.z + A_POSE_OFFSET;
+      case "右腕": return e.z - A_POSE_OFFSET;
+
+      // ===== 팔꿈치 (Java: +/- abs(euler.x)) =====
+      case "左ひじ": return -Math.abs(e.x);
+      case "右ひじ": return Math.abs(e.x);
+
+      // ===== 다리 (Java: -euler.x) =====
+      // 인위적인 HIP_LEAN 제거됨
+      case "左足": return -e.x;
+      case "右足": return -e.x;
+
+      // ===== 무릎 (Java: euler.x) =====
+      // 인위적인 KNEE_BEND 제거됨
+      case "左ひざ": return e.x;
+      case "右ひざ": return e.x;
+
+      // ===== 발목 (Java: -euler.x) =====
+      // 인위적인 ANKLE_LIFT 제거됨
+      case "左足首": return -e.x;
+      case "右足首": return -e.x;
+
+      // ===== 발끝 (Java: euler.z) =====
+      case "左つま先":
+      case "右つま先": return e.z;
+
+      // ===== 몸통 (Java: euler.y) =====
+      case "センター":
+      case "下半身":
+      case "上半身":
+      case "上半身2": return e.y;
+
+      default: return e.z;
+    }
   }
 }
