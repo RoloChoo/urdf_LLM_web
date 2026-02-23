@@ -1,7 +1,26 @@
+// ChatWidget.tsx
+
 "use client";
 
-import { FormEvent, useEffect, useRef, useState } from "react";
-import { ChevronDown, Loader2, Mic, Plus, Sparkles } from "lucide-react";
+import { FormEvent, useEffect, useRef, useState, useCallback } from "react";
+import {
+  ChevronDown,
+  Loader2,
+  Mic,
+  Plus,
+  Sparkles,
+  RefreshCw,
+} from "lucide-react";
+import { ReferenceMotion } from "@/utils/ReferenceMotion";
+import type { VmdKeyframe } from "@/utils/VmdLoader";
+import {
+  MUJOCO_JOINT_ORDER,
+  JOINT_CONSTRAINTS,
+  applyJointConstraints,
+} from "@/constants/jointConfig";
+import type { JointName } from "@/constants/jointConfig";
+
+// ─── 타입 ────────────────────────────────────────────────────
 
 type ConversationMessage = {
   id: string;
@@ -32,6 +51,7 @@ type MotorResponse = {
     time: number;
     speed?: number;
   }>;
+  analysis?: string | null;
   error?: string;
 };
 
@@ -85,194 +105,108 @@ type TaskPlannerResponse = {
   error?: string;
 };
 
-type JointLimits = Record<string, { lower?: number; upper?: number }>;
-type UrdfMeta = { availableJoints: string[]; jointLimitsRadians: JointLimits };
+type JointInfo = { val: number; min: number; max: number };
+
+// ─── 상수 ────────────────────────────────────────────────────
 
 const EMPTY_HINT = "LLM 답변은 이 자리에서 바로 확인할 수 있어요.";
-const DEFAULT_JOINT_NAME_MAP: Record<string, string> = {};
 
-// ============================================================
-// ✅ RL 판별 유틸리티 (문서 지침대로 추가)
-// ============================================================
-const RL_GOAL_ALIASES = new Set(
-  [
-    "start_reinforcement_learning",
-    "start_reinforcement_learning_for_human",
-    "start_reinforcement_learning_for_humanoid",
-    "start_reinforcement_learning_for_mujoco",
-    "start_reinforcement_learning_session",
-    "startreinforcementlearning",
-  ].map((value) => value.toLowerCase()),
-);
+// ─── MuJoCo 관절 컨텍스트 빌더 ──────────────────────────────
 
-const RL_GOAL_REGEXES: RegExp[] = [
-  /start\s*(a|the)?\s*reinforcement[-\s]?learning/i,
-  /(reinforcement[-\s]?learning|강화\s*학습).{0,40}(start|시작|실행|launch|train|훈련|학습)/i,
-  /(start|run|train|launch|execute).{0,40}(reinforcement[-\s]?learning|강화\s*학습)/i,
-  /(reinforcement[-\s]?learning|강화\s*학습).{0,40}(walk|walking|gait|locomotion|보행|걷)/i,
-  /(walk|walking|gait|locomotion|보행|걷).{0,40}(reinforcement[-\s]?learning|강화\s*학습)/i,
-];
-
-const RL_MESSAGE_PATTERNS: RegExp[] = [
-  /강화\s*학습.{0,40}(걷|보행|워킹|walking|walk|gait|locomotion).{0,40}(해줘|해주세요|해줘요|시작|실행|훈련|학습|만들어|시키|run|train|start|execute|launch)/i,
-  /(걷|보행|워킹|walking|walk|gait|locomotion).{0,40}강화\s*학습.{0,40}(해줘|해주세요|해줘요|시작|실행|훈련|학습|만들어|시키|run|train|start|execute|launch)/i,
-  /(reinforcement[-\s]?learning|rl).{0,40}(walk|walking|gait|locomotion).{0,40}(start|run|train|training|execute|launch|kick\s*off|please)/i,
-  /(reinforcement[-\s]?learning|강화\s*학습).{0,40}(walk|walking|gait|locomotion|걷|보행|워킹).{0,40}(하고\s*싶|하고싶|싶어|원해|원합니다|하고자)/i,
-];
-
-const RL_NEGATIVE_PATTERNS: RegExp[] = [
-  /설명/, /알려줘/, /알려\s*줘/, /가르쳐/, /가르쳐\s*줘/, /무엇/, /뭐야/, /뭔지/, /예시/, /방법/,
-  /어떻게/, /왜/, /궁금/, /가능해/, /가능할까/, /가능할까요/,
-];
-
-const RL_COMMAND_PATTERNS: RegExp[] = [
-  /(시작|실행|돌려|켜|훈련|학습|만들어|가동|운영).{0,4}해(?:줘|줘요|주세요|줘라)?/,
-  /(run|start|launch|execute|train|training|initiate|kick\s*off).{0,20}(it|this|rl|policy|session|training)/i,
-  /(make|teach).{0,20}(it|the|robot).{0,20}(walk|gait)/i,
-  /(start|run|launch|execute).{0,20}(reinforcement[-\s]?learning|rl)/i,
-  /(reinforcement[-\s]?learning|강화\s*학습).{0,20}(시작|실행|훈련|학습|만들|돌려|켜)/i,
-];
-
-const RL_DESIRE_PATTERNS: RegExp[] = [
-  /(하고\s*싶|하고싶|하고자|싶어|싶다|싶습니다|원해|원합니다|하고\s*싶습니다)/,
-  /(i\s*want|i'd\s*like|i\s*would\s*like|i\s*want\s*to)\s*(start|run|train|learn)/i,
-];
-
-function shouldStartReinforcementLearning(goal: string, userMessage: string): boolean {
-  const rawGoal = (goal ?? "").trim();
-  const lowerGoal = rawGoal.toLowerCase();
-
-  if (RL_GOAL_ALIASES.has(lowerGoal) || RL_GOAL_ALIASES.has(lowerGoal.replace(/\s+/g, ""))) {
-    return true;
-  }
-
-  if (rawGoal && RL_GOAL_REGEXES.some((regex) => regex.test(rawGoal))) {
-    return true;
-  }
-
-  if (!userMessage) return false;
-
-  const normalizedMessage = userMessage.toLowerCase();
-  const hasRlCue = RL_MESSAGE_PATTERNS.some((regex) => regex.test(normalizedMessage));
-  if (!hasRlCue) return false;
-
-  const hasNegative = RL_NEGATIVE_PATTERNS.some((regex) => regex.test(normalizedMessage));
-  const hasCommand = RL_COMMAND_PATTERNS.some((regex) => regex.test(normalizedMessage));
-  const hasDesire = RL_DESIRE_PATTERNS.some((regex) => regex.test(normalizedMessage));
-
-  if (!hasCommand && !hasDesire) {
-    return false;
-  }
-
-  if (hasNegative && !hasCommand) {
-    return false;
-  }
-
-  return true;
-}
-// ============================================================
-
-const normalizeJointKey = (s: string) =>
-  s
-    .toLowerCase()
-    .replace(/[\s\-_.]/g, "")
-    .replace(/joint/g, "")
-    .trim();
-
-function resolveJointName(
-  llmJoint: string,
-  available: string[],
-  map: Record<string, string>,
-): string | null {
-  if (!llmJoint) return null;
-  if (!Array.isArray(available) || available.length === 0) return null;
-
-  const n = normalizeJointKey(llmJoint);
-
-  const mapped = map[llmJoint] ?? map[llmJoint.toLowerCase()] ?? map[n] ?? null;
-  if (mapped && available.includes(mapped)) return mapped;
-
-  const exact = available.find((a) => a.toLowerCase() === llmJoint.toLowerCase());
-  if (exact) return exact;
-
-  const nExact = available.find((a) => normalizeJointKey(a) === n);
-  if (nExact) return nExact;
-
-  const partial = available.find((a) => {
-    const an = normalizeJointKey(a);
-    return an.includes(n) || n.includes(an);
-  });
-  if (partial) return partial;
-
-  return null;
-}
-
-function getUrdfMetaFromWindowOrDom(): UrdfMeta | null {
-  if (typeof window === "undefined") return null;
-
-  const w = window as any;
-  const jointsFromWindow: unknown = w.__URDF_JOINTS__;
-  const limitsFromWindow: unknown = w.__URDF_JOINT_LIMITS__;
-
-  const availableJoints =
-    Array.isArray(jointsFromWindow) ? (jointsFromWindow as string[]) : [];
-
-  const jointLimitsRadians =
-    limitsFromWindow && typeof limitsFromWindow === "object"
-      ? (limitsFromWindow as JointLimits)
-      : {};
-
-  if (availableJoints.length > 0) return { availableJoints, jointLimitsRadians };
-
-  try {
-    const viewer = document.querySelector("urdf-viewer") as any;
-    const joints = viewer?.robot?.joints;
-    if (joints && typeof joints === "object") {
-      const keys = Object.keys(joints);
-      const limits: JointLimits = {};
-
-      for (const k of keys) {
-        const j = joints[k];
-        const lim = j?.limit ?? j?.limits ?? null;
-
-        const lower =
-          (typeof lim?.lower === "number" ? lim.lower : undefined) ??
-          (typeof lim?.min === "number" ? lim.min : undefined);
-
-        const upper =
-          (typeof lim?.upper === "number" ? lim.upper : undefined) ??
-          (typeof lim?.max === "number" ? lim.max : undefined);
-
-        if (typeof lower === "number" || typeof upper === "number") limits[k] = { lower, upper };
-      }
-
-      return { availableJoints: keys, jointLimitsRadians: limits };
-    }
-  } catch {
-    // ignore
-  }
-
-  return null;
-}
-
-function buildPlannerContext(meta: UrdfMeta | null): string | undefined {
-  if (!meta?.availableJoints?.length) return undefined;
-
-  const payload = {
-    availableJoints: meta.availableJoints,
-    jointLimitsRadians: meta.jointLimitsRadians,
-  };
+function buildMujocoContext(): string {
+  const jointSpec = MUJOCO_JOINT_ORDER.map((name) => {
+    const c = JOINT_CONSTRAINTS[name];
+    return `${name}: [${c.min}, ${c.max}] ${c.note}`;
+  }).join("\n");
 
   return [
-    `URDF_CONTEXT_JSON=${JSON.stringify(payload)}`,
+    "MUJOCO_JOINT_CONTEXT:",
+    `Available joints (${MUJOCO_JOINT_ORDER.length}):`,
+    jointSpec,
     "",
     "Rules:",
-    "- Use ONLY joints from availableJoints exactly (no invented names).",
-    "- Angles are radians.",
-    "- Respect jointLimitsRadians when provided. If missing, keep angles small (e.g. +/-0.3 rad).",
+    "- Use ONLY joints from the list above (exact names).",
+    "- Angles are in radians.",
+    "- LEFT leg joints are sign-mirrored vs RIGHT:",
+    "  l_knee <= 0 (bend = negative), r_knee >= 0 (bend = positive)",
+    "  l_hip_roll <= 0, r_hip_roll >= 0",
+    "  l_hip_pitch: positive = forward swing, r_hip_pitch: negative = forward swing",
+    "- l_el <= 0, r_el >= 0.",
+    "- Keep hip_roll close to 0 (±0.05) for standing balance.",
     "- time is milliseconds.",
+    "- For walking: opposite legs anti-phase, arms swing opposite to same-side leg.",
+    "- PRIORITY: stay standing first. Only attempt walking after stable stance.",
   ].join("\n");
 }
+
+// ─── motor motions → VmdKeyframe[] 변환 ──────────────────────
+
+function motorMotionsToKeyframes(
+  motions: Array<{ joint: string; angle: number; time: number }>,
+  currentJoints?: Record<string, JointInfo> | null,
+): VmdKeyframe[] {
+  const timeMap = new Map<number, Record<string, number>>();
+
+  for (const m of motions) {
+    const resolved = resolveToMujocoJoint(m.joint);
+    if (!resolved) continue;
+
+    const timeMs = m.time ?? 0;
+    if (!timeMap.has(timeMs)) {
+      timeMap.set(timeMs, {});
+    }
+    timeMap.get(timeMs)![resolved] = m.angle;
+  }
+
+  const sortedTimes = [...timeMap.keys()].sort((a, b) => a - b);
+
+  // 현재 관절 상태가 있으면 사용, 없으면 전부 0 (T-pose 세팅은 여기서 하지 않음)
+  const currentPose: Record<string, number> = {};
+  if (currentJoints) {
+    for (const name of MUJOCO_JOINT_ORDER) {
+      currentPose[name] = currentJoints[name]?.val ?? 0;
+    }
+  } else {
+    for (const name of MUJOCO_JOINT_ORDER) {
+      currentPose[name] = 0;
+    }
+  }
+
+  const keyframes: VmdKeyframe[] = [];
+
+  for (const timeMs of sortedTimes) {
+    const updates = timeMap.get(timeMs)!;
+    Object.assign(currentPose, updates);
+    const constrained = applyJointConstraints({ ...currentPose });
+    const timeSec = timeMs / 1000;
+    const frame = Math.round(timeSec * 30);
+    keyframes.push({
+      frame,
+      timeSec,
+      pose: { ...constrained } as Record<string, number>,
+    });
+  }
+
+  return keyframes;
+}
+
+function resolveToMujocoJoint(name: string): JointName | null {
+  if ((MUJOCO_JOINT_ORDER as readonly string[]).includes(name)) {
+    return name as JointName;
+  }
+  const norm = name.toLowerCase().replace(/[\s\-_.]/g, "");
+  for (const jn of MUJOCO_JOINT_ORDER) {
+    const jnNorm = jn.toLowerCase().replace(/[\s\-_.]/g, "");
+    if (jnNorm === norm) return jn;
+  }
+  for (const jn of MUJOCO_JOINT_ORDER) {
+    const jnNorm = jn.toLowerCase().replace(/[\s\-_.]/g, "");
+    if (jnNorm.includes(norm) || norm.includes(jnNorm)) return jn;
+  }
+  return null;
+}
+
+// ─── ai:stage 이벤트 ─────────────────────────────────────────
 
 type Stage = "intent" | "motor" | "execute" | "task_planner";
 type Phase = "start" | "end";
@@ -296,6 +230,10 @@ function emitAiStage(detail: {
   window.dispatchEvent(new CustomEvent("ai:stage", { detail }));
 }
 
+// ═══════════════════════════════════════════════════════════════
+// 메인 컴포넌트
+// ═══════════════════════════════════════════════════════════════
+
 export default function ChatWidget() {
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
@@ -303,27 +241,442 @@ export default function ChatWidget() {
   const [plannerLoading, setPlannerLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // drive 상태
+  const [isDriving, setIsDriving] = useState(false);
+  const driveIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // ─── GamingAgent 자동 루프 상태 ────────────────────────────
+  const autoLoopRef = useRef(false);
+  const [autoLoopRunning, setAutoLoopRunning] = useState(false);
+  const [autoLoopIter, setAutoLoopIter] = useState(0);
+  const [autoLoopStatus, setAutoLoopStatus] = useState("");
+
   const messagesRef = useRef<ConversationMessage[]>([]);
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
 
-  // RL training end -> planner
+  // ─── 현재 관절 상태 저장 ───────────────────────────────────
+
+  const currentPoseRef = useRef<Record<string, number> | null>(null);
+  const jointsRef = useRef<Record<string, JointInfo> | null>(null);
+
+  useEffect(() => {
+    const handler = (ev: MessageEvent) => {
+      const d = ev.data;
+      if (!d || typeof d !== "object") return;
+      if (d.type === "SYNC_STATE" && d.payload?.joints) {
+        const joints = d.payload.joints as Record<string, JointInfo>;
+        jointsRef.current = joints;
+        const pose: Record<string, number> = {};
+        for (const [name, info] of Object.entries(joints)) {
+          pose[name] = info.val;
+        }
+        currentPoseRef.current = pose;
+      }
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, []);
+
+  const getCurrentPose = useCallback((): Record<string, number> | null => {
+    return currentPoseRef.current;
+  }, []);
+
+  // ─── MuJoCo iframe 통신 ────────────────────────────────────
+
+  const sendToMujocoIframe = useCallback((msg: unknown) => {
+    window.dispatchEvent(
+      new CustomEvent("mujoco:postMessage", { detail: msg }),
+    );
+  }, []);
+
+  // ─── ReferenceMotion drive ─────────────────────────────────
+
+  const startMotionDrive = useCallback(
+    (keyframes: VmdKeyframe[], kp = 80, kd = 6): Promise<void> => {
+      return new Promise((resolve) => {
+        if (driveIntervalRef.current) {
+          clearInterval(driveIntervalRef.current);
+          driveIntervalRef.current = null;
+        }
+
+        if (keyframes.length < 2) {
+          resolve();
+          return;
+        }
+
+        sendToMujocoIframe({ type: "RESUME" });
+
+        const jointOrder = [...MUJOCO_JOINT_ORDER] as string[];
+        const refMotion = new ReferenceMotion(
+          jointOrder,
+          keyframes,
+          30,
+          false,
+        );
+        const duration = refMotion.durationSec();
+        const startWall = performance.now();
+        setIsDriving(true);
+
+        driveIntervalRef.current = setInterval(() => {
+          const elapsed = (performance.now() - startWall) / 1000;
+
+          if (elapsed >= duration) {
+            if (driveIntervalRef.current) {
+              clearInterval(driveIntervalRef.current);
+              driveIntervalRef.current = null;
+            }
+            sendToMujocoIframe({
+              type: "SET_JOINT_TARGETS_PD",
+              enabled: false,
+            });
+            setIsDriving(false);
+            resolve();
+            return;
+          }
+
+          const { qRef } = refMotion.sample(elapsed);
+          const targets: Record<string, number> = {};
+          for (let i = 0; i < jointOrder.length; i++) {
+            const name = jointOrder[i];
+            const c = JOINT_CONSTRAINTS[name as JointName];
+            let q = qRef[i] ?? 0;
+            if (c) q = Math.max(c.min, Math.min(c.max, q));
+            targets[name] = q;
+          }
+
+          sendToMujocoIframe({
+            type: "SET_JOINT_TARGETS_PD",
+            enabled: true,
+            targets,
+            kp,
+            kd,
+          });
+        }, 16);
+      });
+    },
+    [sendToMujocoIframe],
+  );
+
+  const stopMotionDrive = useCallback(() => {
+    if (driveIntervalRef.current) {
+      clearInterval(driveIntervalRef.current);
+      driveIntervalRef.current = null;
+    }
+    setIsDriving(false);
+    sendToMujocoIframe({
+      type: "SET_JOINT_TARGETS_PD",
+      enabled: false,
+    });
+  }, [sendToMujocoIframe]);
+
+  useEffect(() => {
+    return () => {
+      if (driveIntervalRef.current) clearInterval(driveIntervalRef.current);
+    };
+  }, []);
+
+  // ─── T-pose 안정화 헬퍼 (리셋/스타팅 시에만 사용) ─────────
+
+  const stabilizeAfterReset = useCallback(
+    async (waitMs = 2000) => {
+      sendToMujocoIframe({ type: "RESET" });
+      sendToMujocoIframe({ type: "RESUME" });
+
+      const tposeTargets: Record<string, number> = {};
+      for (const name of MUJOCO_JOINT_ORDER) tposeTargets[name] = 0;
+      sendToMujocoIframe({
+        type: "SET_JOINT_TARGETS_PD",
+        enabled: true,
+        targets: tposeTargets,
+        kp: 80,
+        kd: 8,
+      });
+      await new Promise((r) => setTimeout(r, waitMs));
+      sendToMujocoIframe({
+        type: "SET_JOINT_TARGETS_PD",
+        enabled: false,
+      });
+      await new Promise((r) => setTimeout(r, 300));
+    },
+    [sendToMujocoIframe],
+  );
+
+  // ═══════════════════════════════════════════════════════════
+  // GamingAgent 스타일 자동 루프 (비전 통합)
+  // ═══════════════════════════════════════════════════════════
+
+  const startAutoLoop = useCallback(
+    async (task: string = "걷기 학습") => {
+      autoLoopRef.current = true;
+      setAutoLoopRunning(true);
+      setAutoLoopIter(0);
+      setAutoLoopStatus("시작...");
+
+      let iteration = 0;
+      const failureHistory: string[] = [];
+      const context = buildMujocoContext();
+
+      function captureFrame(): string | null {
+        try {
+          const iframe = document.querySelector(
+            'iframe[title="MuJoCo Viewer"]',
+          ) as HTMLIFrameElement | null;
+          if (!iframe) return null;
+
+          let sourceCanvas: HTMLCanvasElement | null = null;
+          try {
+            sourceCanvas =
+              iframe.contentDocument?.querySelector("canvas") ?? null;
+          } catch {
+            return null;
+          }
+          if (!sourceCanvas) return null;
+
+          const tmpCanvas = document.createElement("canvas");
+          const scale = Math.min(
+            1,
+            384 / Math.max(sourceCanvas.width, sourceCanvas.height),
+          );
+          tmpCanvas.width = Math.round(sourceCanvas.width * scale);
+          tmpCanvas.height = Math.round(sourceCanvas.height * scale);
+          const ctx = tmpCanvas.getContext("2d");
+          if (!ctx) return null;
+
+          ctx.drawImage(
+            sourceCanvas,
+            0,
+            0,
+            tmpCanvas.width,
+            tmpCanvas.height,
+          );
+          return tmpCanvas.toDataURL("image/png", 0.7);
+        } catch {
+          return null;
+        }
+      }
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: `🔄 비전 기반 GamingAgent 루프를 시작합니다.\n목표: ${task}\n📷 매 사이클 화면을 캡처해서 VLM이 평가합니다.`,
+        },
+      ]);
+
+      while (autoLoopRef.current) {
+        try {
+          const currentPose = getCurrentPose();
+          const stateStr = currentPose
+            ? MUJOCO_JOINT_ORDER.map(
+                (name) =>
+                  `${name}=${(currentPose[name] ?? 0).toFixed(3)}`,
+              ).join(", ")
+            : "no state";
+
+          setAutoLoopIter(iteration);
+
+          const frame = captureFrame();
+          let visionEval = {
+            posture: "unknown",
+            movement: "unknown",
+            quality: 5,
+            fallen: false,
+            suggestion: "continue with conservative motion",
+          };
+
+          if (frame) {
+            setAutoLoopStatus(`iter ${iteration}: 📷 비전 평가 중...`);
+
+            try {
+              const visionResp = await fetch("/api/vision-eval", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  image: frame,
+                  jointState: stateStr,
+                  iteration,
+                  task,
+                }),
+              });
+
+              if (visionResp.ok) {
+                visionEval = await visionResp.json();
+              }
+            } catch (err) {
+              console.warn("[auto-loop] vision eval failed:", err);
+            }
+          } else {
+            setAutoLoopStatus(
+              `iter ${iteration}: 📷 캡처 불가, 상태값만 사용`,
+            );
+          }
+
+          if (visionEval.fallen) {
+            failureHistory.push(
+              `iter${iteration}: FALLEN (quality=${visionEval.quality}, posture=${visionEval.posture})`,
+            );
+            if (failureHistory.length > 20) failureHistory.shift();
+
+            if (iteration % 3 === 0) {
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: crypto.randomUUID(),
+                  role: "assistant",
+                  content: `⚠️ iter ${iteration}: 넘어짐 감지! (${visionEval.posture}) 리셋 후 안정화...`,
+                },
+              ]);
+            }
+
+            await stabilizeAfterReset(2000);
+            iteration++;
+            continue;
+          }
+
+          setAutoLoopStatus(
+            `iter ${iteration}: 🧠 모션 생성 중 (quality=${visionEval.quality})...`,
+          );
+
+          const motorReqBody = {
+            intent: {
+              goal: `continue ${task}`,
+              style:
+                visionEval.quality < 3 ? "very_conservative" : "steady",
+              duration_ms: 2000,
+            },
+            context,
+            message: [
+              `[Vision-guided auto-loop iteration ${iteration}]`,
+              `Task: ${task}`,
+              `Vision evaluation: posture=${visionEval.posture}, movement=${visionEval.movement}, quality=${visionEval.quality}/10`,
+              `VLM suggestion: ${visionEval.suggestion}`,
+              `Current joints: ${stateStr}`,
+              failureHistory.length > 0
+                ? `Recent failures: ${failureHistory.slice(-3).join("; ")}`
+                : "",
+              visionEval.quality < 3
+                ? "PRIORITY: Very poor state. Use small, safe movements only."
+                : "Generate next 1-2 second walking segment.",
+              `Spread motions across time (0, 200, 400... ms). All 20 joints.`,
+            ]
+              .filter(Boolean)
+              .join("\n"),
+          };
+
+          const motorResp = await fetch("/api/motor", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(motorReqBody),
+          });
+
+          if (!autoLoopRef.current) break;
+
+          const motorData = (await motorResp.json()) as MotorResponse;
+
+          if (!motorResp.ok || !motorData?.motions?.length) {
+            failureHistory.push(`iter${iteration}: motor failed`);
+            if (failureHistory.length > 20) failureHistory.shift();
+            setAutoLoopStatus(
+              `iter ${iteration}: motor 실패, 2초 후 재시도`,
+            );
+            await new Promise((r) => setTimeout(r, 2000));
+            iteration++;
+            continue;
+          }
+
+          if (motorData.analysis) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: crypto.randomUUID(),
+                role: "assistant",
+                content: `🧠 **iter ${iteration}** — ${motorData.analysis}`,
+              },
+            ]);
+          }
+
+          const keyframes = motorMotionsToKeyframes(
+            motorData.motions,
+            jointsRef.current,
+          );
+
+          if (keyframes.length >= 2) {
+            setAutoLoopStatus(
+              `iter ${iteration}: ▶ ${motorData.motions.length} motions (q=${visionEval.quality})`,
+            );
+            await startMotionDrive(keyframes);
+            await new Promise((r) => setTimeout(r, 300));
+          } else {
+            await new Promise((r) => setTimeout(r, 1000));
+          }
+
+          if (iteration % 5 === 0 && iteration > 0) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: crypto.randomUUID(),
+                role: "assistant",
+                content: `🔄 iter ${iteration} | quality: ${visionEval.quality}/10 | ${visionEval.posture} / ${visionEval.movement} | 실패: ${failureHistory.length}회`,
+              },
+            ]);
+          }
+
+          iteration++;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error("[auto-loop]", err);
+          failureHistory.push(`iter${iteration}: error (${msg})`);
+          if (failureHistory.length > 20) failureHistory.shift();
+          setAutoLoopStatus(`iter ${iteration}: 에러, 2초 후 재시도`);
+          await new Promise((r) => setTimeout(r, 2000));
+          iteration++;
+        }
+      }
+
+      setAutoLoopRunning(false);
+      setAutoLoopStatus("정지됨");
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: `⏹ 비전 루프 종료 (${iteration}회 실행)`,
+        },
+      ]);
+    },
+    [getCurrentPose, startMotionDrive, sendToMujocoIframe, stabilizeAfterReset],
+  );
+
+  const stopAutoLoop = useCallback(() => {
+    autoLoopRef.current = false;
+    stopMotionDrive();
+    setAutoLoopStatus("정지 중...");
+  }, [stopMotionDrive]);
+
+  // ═══════════════════════════════════════════════════════════
+  // RL training end → planner
+  // ═══════════════════════════════════════════════════════════
+
   useEffect(() => {
     const onTrainingSummary = (ev: Event) => {
       const summary = (ev as CustomEvent<RLTrainingSummary>).detail;
       void runTaskPlanner(summary);
     };
-
     window.addEventListener("rl:trainingSummary", onTrainingSummary as any);
-    return () => window.removeEventListener("rl:trainingSummary", onTrainingSummary as any);
+    return () =>
+      window.removeEventListener(
+        "rl:trainingSummary",
+        onTrainingSummary as any,
+      );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function runTaskPlanner(summary: RLTrainingSummary) {
     try {
       setPlannerLoading(true);
-
       setMessages((prev) => [
         ...prev,
         {
@@ -333,19 +686,19 @@ export default function ChatWidget() {
         },
       ]);
 
-      const urdfMeta = getUrdfMetaFromWindowOrDom();
-      const context = buildPlannerContext(urdfMeta);
-
-      const historyPayload = messagesRef.current.map(({ role, content }) => ({ role, content }));
-
-      const reqBody = {
-        summary,
-        history: historyPayload,
-        context,
-      };
-
+      const context = buildMujocoContext();
+      const historyPayload = messagesRef.current.map(({ role, content }) => ({
+        role,
+        content,
+      }));
+      const reqBody = { summary, history: historyPayload, context };
       const inChars = JSON.stringify(reqBody).length;
-      emitAiStage({ stage: "task_planner", phase: "start", inChars, inTok: estTok(inChars) });
+      emitAiStage({
+        stage: "task_planner",
+        phase: "start",
+        inChars,
+        inTok: estTok(inChars),
+      });
 
       const t0 = performance.now();
       const resp = await fetch("/api/task-planner", {
@@ -353,11 +706,9 @@ export default function ChatWidget() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(reqBody),
       });
-
       const data = (await resp.json()) as TaskPlannerResponse;
       const ms = Math.round(performance.now() - t0);
       const outChars = JSON.stringify(data).length;
-
       emitAiStage({
         stage: "task_planner",
         phase: "end",
@@ -370,16 +721,20 @@ export default function ChatWidget() {
       });
 
       if (!resp.ok) throw new Error(data?.error || "task-planner 실패");
-
       if (data?.text?.trim()) {
         setMessages((prev) => [
           ...prev,
-          { id: crypto.randomUUID(), role: "assistant", content: data.text.trim() },
+          {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: data.text.trim(),
+          },
         ]);
       }
-
       if (data?.plan) {
-        window.dispatchEvent(new CustomEvent("rl:applyPlan", { detail: data.plan }));
+        window.dispatchEvent(
+          new CustomEvent("rl:applyPlan", { detail: data.plan }),
+        );
       }
     } catch (e) {
       console.error("[task-planner] error:", e);
@@ -396,10 +751,12 @@ export default function ChatWidget() {
     }
   }
 
-  // chat submit (intent/motor/execute)
+  // ═══════════════════════════════════════════════════════════
+  // chat submit: intent → motor → execute
+  // ═══════════════════════════════════════════════════════════
+
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-
     const trimmed = message.trim();
     if (!trimmed) return;
 
@@ -408,8 +765,10 @@ export default function ChatWidget() {
       role: "user",
       content: trimmed,
     };
-
-    const historyPayload = messages.map(({ role, content }) => ({ role, content }));
+    const historyPayload = messages.map(({ role, content }) => ({
+      role,
+      content,
+    }));
 
     setMessages((prev) => [...prev, userMessage]);
     setMessage("");
@@ -417,11 +776,175 @@ export default function ChatWidget() {
     setError(null);
 
     try {
-      const urdfMeta = getUrdfMetaFromWindowOrDom();
-      const context = buildPlannerContext(urdfMeta);
+      const context = buildMujocoContext();
 
-      // 1) intent
-      const intentReqBody = { message: trimmed, history: historyPayload, context };
+      // ── 자동 루프 명령 감지 ────────────────────────────
+      const lower = trimmed.toLowerCase();
+      const isAutoStart =
+        lower.includes("자동") ||
+        lower.includes("루프") ||
+        lower.includes("gaming") ||
+        lower.includes("agent") ||
+        lower.includes("반복") ||
+        (lower.includes("계속") && lower.includes("학습"));
+
+      if (isAutoStart && !autoLoopRunning) {
+        startAutoLoop(trimmed);
+        return;
+      }
+
+      const isAutoStop =
+        lower.includes("멈") ||
+        lower.includes("스톱") ||
+        lower.includes("stop") ||
+        lower.includes("중단") ||
+        lower.includes("그만");
+
+      if (isAutoStop && autoLoopRunning) {
+        stopAutoLoop();
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: "자동 루프를 멈춥니다.",
+          },
+        ]);
+        return;
+      }
+
+      // ── test 명령 ──────────────────────────────────────
+      if (lower === "test") {
+        const rawTestKeyframes: VmdKeyframe[] = [
+          {
+            frame: 0,
+            timeSec: 0,
+            pose: {
+              l_hip_pitch: 0,
+              r_hip_pitch: 0,
+              l_knee: -0.2,
+              r_knee: 0.2,
+              l_sho_roll: 0.52,
+              r_sho_roll: -0.52,
+              l_el: -0.3,
+              r_el: 0.3,
+              l_hip_roll: 0,
+              r_hip_roll: 0,
+              l_hip_yaw: 0,
+              r_hip_yaw: 0,
+              l_ank_pitch: 0,
+              r_ank_pitch: 0,
+              l_ank_roll: 0,
+              r_ank_roll: 0,
+              l_sho_pitch: 0.3,
+              r_sho_pitch: -0.3,
+              head_pan: 0,
+              head_tilt: 0,
+            },
+          },
+          {
+            frame: 15,
+            timeSec: 0.5,
+            pose: {
+              l_hip_pitch: 0.4,
+              r_hip_pitch: -0.3,
+              l_knee: -0.5,
+              r_knee: 0.15,
+              l_sho_roll: 0.52,
+              r_sho_roll: -0.52,
+              l_el: -0.3,
+              r_el: 0.3,
+              l_hip_roll: 0,
+              r_hip_roll: 0,
+              l_hip_yaw: 0,
+              r_hip_yaw: 0,
+              l_ank_pitch: -0.2,
+              r_ank_pitch: 0.15,
+              l_ank_roll: 0,
+              r_ank_roll: 0,
+              l_sho_pitch: -0.3,
+              r_sho_pitch: 0.3,
+              head_pan: 0,
+              head_tilt: 0,
+            },
+          },
+          {
+            frame: 30,
+            timeSec: 1.0,
+            pose: {
+              l_hip_pitch: -0.3,
+              r_hip_pitch: 0.4,
+              l_knee: -0.15,
+              r_knee: 0.5,
+              l_sho_roll: 0.52,
+              r_sho_roll: -0.52,
+              l_el: -0.3,
+              r_el: 0.3,
+              l_hip_roll: 0,
+              r_hip_roll: 0,
+              l_hip_yaw: 0,
+              r_hip_yaw: 0,
+              l_ank_pitch: 0.15,
+              r_ank_pitch: -0.2,
+              l_ank_roll: 0,
+              r_ank_roll: 0,
+              l_sho_pitch: 0.3,
+              r_sho_pitch: -0.3,
+              head_pan: 0,
+              head_tilt: 0,
+            },
+          },
+          {
+            frame: 45,
+            timeSec: 1.5,
+            pose: {
+              l_hip_pitch: 0,
+              r_hip_pitch: 0,
+              l_knee: -0.2,
+              r_knee: 0.2,
+              l_sho_roll: 0.52,
+              r_sho_roll: -0.52,
+              l_el: -0.3,
+              r_el: 0.3,
+              l_hip_roll: 0,
+              r_hip_roll: 0,
+              l_hip_yaw: 0,
+              r_hip_yaw: 0,
+              l_ank_pitch: 0,
+              r_ank_pitch: 0,
+              l_ank_roll: 0,
+              r_ank_roll: 0,
+              l_sho_pitch: 0,
+              r_sho_pitch: 0,
+              head_pan: 0,
+              head_tilt: 0,
+            },
+          },
+        ];
+
+        const testKeyframes = rawTestKeyframes.map((kf) => ({
+          ...kf,
+          pose: applyJointConstraints({ ...kf.pose }),
+        }));
+
+        startMotionDrive(testKeyframes);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: "테스트 모션 실행 중...",
+          },
+        ]);
+        return;
+      }
+
+      // ── 1) intent ──────────────────────────────────────
+      const intentReqBody = {
+        message: trimmed,
+        history: historyPayload,
+        context,
+      };
       const intentInChars = JSON.stringify(intentReqBody).length;
       emitAiStage({
         stage: "intent",
@@ -437,7 +960,6 @@ export default function ChatWidget() {
         body: JSON.stringify(intentReqBody),
       });
       const intentData = (await intentResp.json()) as IntentResponse;
-
       emitAiStage({
         stage: "intent",
         phase: "end",
@@ -449,21 +971,36 @@ export default function ChatWidget() {
         outTok: estTok(JSON.stringify(intentData).length),
       });
 
-      if (!intentResp.ok) throw new Error(intentData?.error || "명령 해석(intent) 실패");
+      if (!intentResp.ok)
+        throw new Error(intentData?.error || "명령 해석(intent) 실패");
 
       const displayText = intentData?.text?.trim();
       if (displayText) {
         setMessages((prev) => [
           ...prev,
-          { id: crypto.randomUUID(), role: "assistant", content: displayText },
+          {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: displayText,
+          },
         ]);
       }
 
-      // ✅ RL 시작 명령 체크 (개선된 로직 적용)
+      // ── RL 시작 명령 체크 ──────────────────────────────
       const goalRaw = intentData?.intent?.goal ?? "";
-      const shouldStartRl = shouldStartReinforcementLearning(goalRaw, trimmed);
+      const goal = String(goalRaw).toLowerCase();
 
-      if (shouldStartRl) {
+      const isRLStart =
+        goal === "start_reinforcement_learning" ||
+        goal === "start_reinforcement_learning_for_human" ||
+        goal === "start_reinforcement_learning_for_humanoid" ||
+        goal === "start_reinforcement_learning_for_mujoco" ||
+        goal === "start_reinforcement_learning_session" ||
+        (goal.includes("reinforcement") &&
+          goal.includes("learning") &&
+          goal.includes("start"));
+
+      if (isRLStart) {
         window.dispatchEvent(
           new CustomEvent("rl:startTraining", {
             detail: {
@@ -471,7 +1008,6 @@ export default function ChatWidget() {
             },
           }),
         );
-
         setMessages((prev) => [
           ...prev,
           {
@@ -480,12 +1016,34 @@ export default function ChatWidget() {
             content: "강화학습 트레이닝을 시작합니다. (MuJoCo RL 모드)",
           },
         ]);
-
         return;
       }
 
-      // 2) motor
-      const motorReqBody = { intent: intentData.intent, context, message: trimmed };
+      // ── stop 체크 ──────────────────────────────────────
+      if (
+        (goal.includes("stop") ||
+          goal.includes("stand") ||
+          goal.includes("pause")) &&
+        isDriving
+      ) {
+        stopMotionDrive();
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: "모션을 멈췄습니다.",
+          },
+        ]);
+        return;
+      }
+
+      // ── 2) motor ───────────────────────────────────────
+      const motorReqBody = {
+        intent: intentData.intent,
+        context,
+        message: trimmed,
+      };
       const motorInChars = JSON.stringify(motorReqBody).length;
       emitAiStage({
         stage: "motor",
@@ -501,7 +1059,6 @@ export default function ChatWidget() {
         body: JSON.stringify(motorReqBody),
       });
       const motorData = (await motorResp.json()) as MotorResponse;
-
       emitAiStage({
         stage: "motor",
         phase: "end",
@@ -513,12 +1070,26 @@ export default function ChatWidget() {
         outTok: estTok(JSON.stringify(motorData).length),
       });
 
-      if (!motorResp.ok) throw new Error(motorData?.error || "motor compile 실패");
-      if (!Array.isArray(motorData?.motions) || motorData.motions.length === 0) {
+      if (!motorResp.ok)
+        throw new Error(motorData?.error || "motor compile 실패");
+      if (
+        !Array.isArray(motorData?.motions) ||
+        motorData.motions.length === 0
+      )
         throw new Error("motor API가 motions를 반환하지 않았습니다.");
+
+      if (motorData.analysis) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: `🧠 ${motorData.analysis}`,
+          },
+        ]);
       }
 
-      // 3) execute (async)
+      // ── 3) execute ─────────────────────────────────────
       void (async () => {
         const execReqBody = { motions: motorData.motions, context };
         const execInChars = JSON.stringify(execReqBody).length;
@@ -536,8 +1107,9 @@ export default function ChatWidget() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(execReqBody),
           });
-
-          const execData: ExecuteResponse | null = await execResponse.json().catch(() => null);
+          const execData: ExecuteResponse | null = await execResponse
+            .json()
+            .catch(() => null);
 
           emitAiStage({
             stage: "execute",
@@ -547,40 +1119,60 @@ export default function ChatWidget() {
             inChars: execInChars,
             outChars: execData ? JSON.stringify(execData).length : 0,
             inTok: estTok(execInChars),
-            outTok: execData ? estTok(JSON.stringify(execData).length) : 0,
+            outTok: execData
+              ? estTok(JSON.stringify(execData).length)
+              : 0,
           });
 
           if (!execResponse.ok) {
-            console.warn("[execute] failed:", execResponse.status, execData);
+            console.warn(
+              "[execute] failed:",
+              execResponse.status,
+              execData,
+            );
             return;
           }
 
           const finalMotions =
-            Array.isArray(execData?.motions) && execData!.motions!.length > 0
+            Array.isArray(execData?.motions) &&
+            execData!.motions!.length > 0
               ? execData!.motions!
               : motorData.motions;
 
-          const latestMeta = getUrdfMetaFromWindowOrDom() ?? urdfMeta;
-          const available = latestMeta?.availableJoints ?? [];
+          const keyframes = motorMotionsToKeyframes(
+            finalMotions as Array<{
+              joint: string;
+              angle: number;
+              time: number;
+            }>,
+            jointsRef.current,
+          );
 
-          const mappedMotions =
-            available.length > 0
-              ? finalMotions.map((m: any) => {
-                  const resolved = resolveJointName(m.joint, available, DEFAULT_JOINT_NAME_MAP);
-                  if (!resolved) return m;
-                  return resolved !== m.joint ? { ...m, joint: resolved } : m;
-                })
-              : finalMotions;
+          if (keyframes.length >= 2) {
+            startMotionDrive(keyframes);
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: crypto.randomUUID(),
+                role: "assistant",
+                content: `모션 적용 중 (${keyframes.length}개 키프레임, ${keyframes[keyframes.length - 1].timeSec.toFixed(1)}초)`,
+              },
+            ]);
+          } else if (keyframes.length === 1) {
+            sendToMujocoIframe({
+              type: "SET_JOINT_TARGETS_PD",
+              enabled: true,
+              targets: keyframes[0].pose,
+              kp: 80,
+              kd: 6,
+            });
+          }
 
           window.dispatchEvent(
             new CustomEvent("robot:moveJoints", {
               detail: {
-                motions: mappedMotions,
-                options: {
-                  animate: true,
-                  defaultDurationMs: 350,
-                  jointNameMap: DEFAULT_JOINT_NAME_MAP,
-                },
+                motions: finalMotions,
+                options: { animate: true, defaultDurationMs: 350 },
               },
             }),
           );
@@ -602,12 +1194,19 @@ export default function ChatWidget() {
     }
   };
 
+  // ═══════════════════════════════════════════════════════════
+  // RENDER
+  // ═══════════════════════════════════════════════════════════
+
   return (
     <div className="fixed bottom-4 left-4 right-4 z-40 sm:right-auto sm:w-[360px]">
       <div className="rounded-[28px] border border-white/70 bg-white/90 p-5 shadow-[0_24px_60px_rgba(0,0,0,0.15)] backdrop-blur-xl">
-        <h2 className="text-lg font-semibold text-[#1c1c1c]">어디서부터 시작할까요?</h2>
+        <h2 className="text-lg font-semibold text-[#1c1c1c]">
+          어디서부터 시작할까요?
+        </h2>
 
         <div className="mt-4 space-y-3">
+          {/* ── 메시지 영역 ───────────────────────────────── */}
           <div className="max-h-64 space-y-2 overflow-y-auto pr-1 text-sm text-[#2f2f2f]">
             {messages.length === 0 ? (
               <p className="rounded-2xl border border-[#f3e9ce] bg-[#fffbf3] px-4 py-3 text-[#7d7256]">
@@ -617,7 +1216,11 @@ export default function ChatWidget() {
               messages.map((item) => (
                 <div
                   key={item.id}
-                  className={`flex ${item.role === "assistant" ? "justify-start" : "justify-end"}`}
+                  className={`flex ${
+                    item.role === "assistant"
+                      ? "justify-start"
+                      : "justify-end"
+                  }`}
                 >
                   <div
                     className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 shadow-sm ${
@@ -635,18 +1238,65 @@ export default function ChatWidget() {
             {(isLoading || plannerLoading) && (
               <div className="flex items-center gap-2 text-xs text-[#7d7256]">
                 <Loader2 className="h-4 w-4 animate-spin" />
-                {plannerLoading ? "플래너가 다음 목표를 만드는 중…" : "생각을 정리하고 있어요…"}
+                {plannerLoading
+                  ? "플래너가 다음 목표를 만드는 중…"
+                  : "생각을 정리하고 있어요…"}
               </div>
             )}
           </div>
 
+          {/* ── GamingAgent 자동 루프 상태 ─────────────────── */}
+          {autoLoopRunning && (
+            <div className="rounded-2xl border border-[#e0d4f5] bg-[#f3eeff] px-3 py-2">
+              <div className="flex items-center justify-between">
+                <span className="flex items-center gap-2 text-xs font-semibold text-[#5b21b6]">
+                  <RefreshCw className="h-3 w-3 animate-spin" />
+                  GamingAgent 루프
+                </span>
+                <button
+                  type="button"
+                  onClick={stopAutoLoop}
+                  className="rounded-lg bg-[#c62828] px-2 py-1 text-[10px] font-bold text-white transition hover:bg-[#b71c1c]"
+                >
+                  STOP
+                </button>
+              </div>
+              <div className="mt-1 font-mono text-[10px] text-[#7c3aed]">
+                iter: {autoLoopIter} | {autoLoopStatus}
+              </div>
+            </div>
+          )}
+
+          {/* ── drive 상태 표시 ─────────────────────────────── */}
+          {isDriving && !autoLoopRunning && (
+            <div className="flex items-center justify-between rounded-2xl border border-[#c8e6c9] bg-[#e8f5e9] px-3 py-2">
+              <span className="flex items-center gap-2 text-xs text-[#2e7d32]">
+                <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-[#4caf50]" />
+                모션 드라이브 실행 중
+              </span>
+              <button
+                type="button"
+                onClick={stopMotionDrive}
+                className="rounded-lg bg-[#c62828] px-2 py-1 text-[10px] font-bold text-white transition hover:bg-[#b71c1c]"
+              >
+                STOP
+              </button>
+            </div>
+          )}
+
+          {/* ── 에러 ───────────────────────────────────────── */}
           {error && (
             <p className="rounded-xl border border-red-100 bg-red-50 px-3 py-2 text-xs text-red-600">
               {error}
             </p>
           )}
 
-          <form className="flex flex-col gap-3" onSubmit={handleSubmit} role="search">
+          {/* ── 입력 폼 ───────────────────────────────────── */}
+          <form
+            className="flex flex-col gap-3"
+            onSubmit={handleSubmit}
+            role="search"
+          >
             <div className="flex items-center gap-3 rounded-2xl border border-[#efe4c8] bg-[#fffbf3] px-2.5 py-1.5">
               <button
                 type="button"
@@ -673,7 +1323,10 @@ export default function ChatWidget() {
                 disabled={isLoading}
               >
                 {isLoading ? (
-                  <Loader2 className="h-5 w-5 animate-spin" strokeWidth={2.2} />
+                  <Loader2
+                    className="h-5 w-5 animate-spin"
+                    strokeWidth={2.2}
+                  />
                 ) : (
                   <Mic className="h-5 w-5" strokeWidth={2.2} />
                 )}
@@ -686,7 +1339,10 @@ export default function ChatWidget() {
                 className="flex w-max items-center gap-1.5 rounded-full border border-[#eee2c3] bg-white/80 px-4 py-2 text-sm text-[#5f5a4a] transition hover:bg-[#fdf7e6]"
                 disabled
               >
-                <Sparkles className="h-4 w-4 text-[#c59f34]" strokeWidth={2.4} />
+                <Sparkles
+                  className="h-4 w-4 text-[#c59f34]"
+                  strokeWidth={2.4}
+                />
                 Extended thinking
                 <ChevronDown className="h-4 w-4" strokeWidth={2.2} />
               </button>
